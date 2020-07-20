@@ -1,0 +1,9 @@
+CREATE OR REPLACE FUNCTION lsm3_handler(internal)
+RETURNS index_am_handler
+AS 'MODULE_PATHNAME'
+LANGUAGE C;
+
+CREATE OR REPLACE FUNCTION lsm3_btree_wrapper(internal)
+RETURNS index_am_handler
+AS 'MODULE_PATHNAME'
+LANGUAGE C;
