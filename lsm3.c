@@ -128,6 +128,7 @@ lsm3_get_entry(Relation index)
 	if (!found)
 	{
 		char* relname = RelationGetRelationName(index);
+		lsm3_init_entry(entry, index->rd_index->indrelid);
 		for (int i = 0; i < 2; i++)
 		{
 			char* topidxname = psprintf("%s_top%d", relname, i);
@@ -137,7 +138,6 @@ lsm3_get_entry(Relation index)
 				elog(ERROR, "Lsm3: failed to lookup %s index", topidxname);
 			}
 		}
-		lsm3_init_entry(entry, index->rd_index->indrelid);
 		entry->active_index = lsm3_get_height_by_oid(entry->top[0]) >= lsm3_get_height_by_oid(entry->top[1]) ? 0 : 1;
 	}
 	LWLockRelease(Lsm3DictLock);
@@ -190,7 +190,7 @@ static void
 lsm3_truncate_index(Oid index_oid, Oid heap_oid)
 {
 	Relation index = index_open(index_oid, AccessExclusiveLock);
-	Relation heap = table_open(heap_oid, AccessShareLock);
+	Relation heap = table_open(heap_oid, AccessShareLock); /* heap is actually not used, because we will not load data to top indexes */
 	IndexInfo* indexInfo = BuildDummyIndexInfo(index);
 	RelationTruncate(index, 0);
 	index_build(heap, index, indexInfo, true, false);
@@ -210,7 +210,7 @@ lsm3_merge_indexes(Oid dst_oid, Oid src_oid, Oid heap_oid)
 	scan->xs_want_itup = true;
 	for (ok = _bt_first(scan, ForwardScanDirection); ok; ok = _bt_next(scan, ForwardScanDirection))
 	{
-		if (!_bt_doinsert(base_index, scan->xs_itup, false, heap))
+		if (!_bt_doinsert(base_index, scan->xs_itup, false, heap)) /* lsm3 index is not unique so need not to heck for duplicates */
 		{
 			elog(ERROR, "Lsm3: failed to insert tuple in base index");
 		}
@@ -248,18 +248,18 @@ lsm3_merger_main(Datum arg)
 		pgstat_report_activity(STATE_IDLE, "waiting");
 		wr = WaitLatch(MyLatch, WL_LATCH_SET | WL_EXIT_ON_PM_DEATH, -1L, PG_WAIT_EXTENSION);
 
-		if (wr & WL_POSTMASTER_DEATH)
+		if ((wr & WL_POSTMASTER_DEATH) || Lsm3Cancel)
 		{
 			break;
 		}
 
 		ResetLatch(MyLatch);
 
-		/* Check if merge is reuested under spinlock */
+		/* Check if merge is requested under spinlock */
 		SpinLockAcquire(&entry->spinlock);
 		if (entry->start_merge)
 		{
-			merge_index = 1 - entry->active_index;
+			merge_index = 1 - entry->active_index; /* at this moment active index should already by swapped */
 			entry->start_merge = false;
 		}
 		SpinLockRelease(&entry->spinlock);
@@ -268,10 +268,12 @@ lsm3_merger_main(Datum arg)
 		{
 			pgstat_report_activity(STATE_RUNNING, "merging");
 			lsm3_merge_indexes(entry->base, entry->top[merge_index], entry->heap);
+
 			pgstat_report_activity(STATE_RUNNING, "truncate");
 			lsm3_truncate_index(entry->top[merge_index], entry->heap);
+
 			SpinLockAcquire(&entry->spinlock);
-			entry->merge_in_progress = false;
+			entry->merge_in_progress = false; /* mark merge as completed */
 			SpinLockRelease(&entry->spinlock);
 		}
 	}
@@ -343,15 +345,9 @@ static IndexBuildResult *
 lsm3_build(Relation heap, Relation index, IndexInfo *indexInfo)
 {
 	LWLockAcquire(Lsm3DictLock, LW_EXCLUSIVE); /* Obtain exclusive lock on dictionary: it will be released in utility hook */
-	Lsm3Entry = hash_search(Lsm3Dict, &RelationGetRelid(index), HASH_ENTER, NULL); /* Setting Lsm3Entry indicates to utility hook that Lsm index was created */
+	Lsm3Entry = hash_search(Lsm3Dict, &RelationGetRelid(index), HASH_ENTER, NULL); /* Setting Lsm3Entry indicates to utility hook that Lsm3 index was created */
 	lsm3_init_entry(Lsm3Entry, RelationGetRelid(heap));
 	return btbuild(heap, index, indexInfo);
-}
-
-static void
-lsm3_buildempty(Relation index)
-{
-	elog(ERROR, "Lsm3: unlogged Lsm2 indexes are not supported");
 }
 
 /* Insert in active top index, on overflow swap active indexes and initiate merge to base index */
@@ -364,10 +360,10 @@ lsm3_insert(Relation rel, Datum *values, bool *isnull,
 	Lsm3DictEntry* entry = lsm3_get_entry(rel);
 	bool ok;
 	int active_index;
-	uint64 n_merges;
+	uint64 n_merges; /* used to check if merge was initiated by somebody else */
 	Relation index;
 
-	/* Obtai current active index and increment access counter under spinock */
+	/* Obtain current active index and increment access counter under spinlock */
 	SpinLockAcquire(&entry->spinlock);
 	active_index = entry->active_index;
 	entry->access_count[active_index] += 1;
@@ -381,16 +377,18 @@ lsm3_insert(Relation rel, Datum *values, bool *isnull,
 
 	if (ok)
 	{
-		/* Otimization: do not check for overflow if merge was already intiated */
+		/* Otimization: do not check for overflow if merge was already initiated */
 		bool overflow = !entry->merge_in_progress && lsm3_get_height(rel) > Lsm3TopIndexHeight;
 		SpinLockAcquire(&entry->spinlock);
 		/* If merge was not initiated before by somebody else, then do it */
 		if (overflow && !entry->merge_in_progress && entry->n_merges == n_merges)
 		{
+			Assert(entry->active_index == active_index);
 			entry->merge_in_progress = true;
 			entry->active_index ^= 1; /* swap top indexes */
 			entry->n_merges += 1;
 		}
+		Assert(entry->access_count[active_index] > 0);
 		entry->access_count[active_index] -= 1;
 		/* If all inserts in previous active index are completed then we can start merge */
 		if (entry->merge_in_progress && entry->active_index != active_index && entry->access_count[active_index] == 0)
@@ -428,7 +426,7 @@ lsm3_beginscan(Relation rel, int nkeys, int norderbys)
 		so->top_index[i] = index_open(so->entry->top[i], AccessShareLock);
 		so->scan[i] = btbeginscan(so->top_index[i], nkeys, norderbys);
 	}
-	so->scan[3] = btbeginscan(rel, nkeys, norderbys);
+	so->scan[2] = btbeginscan(rel, nkeys, norderbys);
 	for (i = 0; i < 3; i++)
 	{
 		so->eof[i] = false;
@@ -477,7 +475,7 @@ lsm3_gettuple(IndexScanDesc scan, ScanDirection dir)
 
 	for (int i = 0; i < 3; i++)
 	{
-		BTScanOpaque bto = (BTScanOpaque) scan->opaque;
+		BTScanOpaque bto = (BTScanOpaque)so->scan[i]->opaque;
 		if (!so->eof[i] && !BTScanPosIsValid(bto->currPos))
 		{
 			so->eof[i] = !_bt_first(so->scan[i], dir);
@@ -493,7 +491,7 @@ lsm3_gettuple(IndexScanDesc scan, ScanDirection dir)
 				int result = lsm3_compare_index_tuples(so->scan[i], so->scan[min], so->sortKeys);
 				if (result == 0)
 				{
-					/* DuplicateL it can happen during merge when same tid is both in top and base index */
+					/* Duplicate: it can happen during merge when same tid is both in top and base index */
 					so->eof[i] = !_bt_next(so->scan[i], dir); /* just skip one of entries */
 				}
 				else if ((result < 0) == ScanDirectionIsForward(dir))
@@ -518,7 +516,7 @@ lsm3_gettuple(IndexScanDesc scan, ScanDirection dir)
 static int64
 lsm3_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 {
-	Lsm3ScanOpaque* so = (Lsm3ScanOpaque*)scan->opaque;	
+	Lsm3ScanOpaque* so = (Lsm3ScanOpaque*)scan->opaque;
 	int64 ntids = btgetbitmap(so->scan[2], tbm);
 	for (int i = 0; i < 2; i++)
 	{
@@ -556,7 +554,7 @@ lsm3_handler(PG_FUNCTION_ARGS)
 	amroutine->amkeytype = InvalidOid;
 
 	amroutine->ambuild = lsm3_build;
-	amroutine->ambuildempty = lsm3_buildempty;
+	amroutine->ambuildempty = btbuildempty;
 	amroutine->aminsert = lsm3_insert;
 	amroutine->ambulkdelete = btbulkdelete;
 	amroutine->amvacuumcleanup = btvacuumcleanup;
@@ -583,6 +581,39 @@ lsm3_handler(PG_FUNCTION_ARGS)
 /*
  * Access methods for B-Tree wrapper: actually we aonly want to disable inserts.
  */
+
+/* We do not need to load data in top top index: just initialize index metadata */
+static IndexBuildResult *
+lsm3_build_empty(Relation heap, Relation index, IndexInfo *indexInfo)
+{
+	Page		metapage;
+
+	/* Construct metapage. */
+	metapage = (Page) palloc(BLCKSZ);
+	_bt_initmetapage(metapage, P_NONE, 0, _bt_allequalimage(index, false));
+
+	/*
+	 * Write the page and log it.  It might seem that an immediate sync would
+	 * be sufficient to guarantee that the file exists on disk, but recovery
+	 * itself might remove it while replaying, for example, an
+	 * XLOG_DBASE_CREATE or XLOG_TBLSPC_CREATE record.  Therefore, we need
+	 * this even when wal_level=minimal.
+	 */
+	PageSetChecksumInplace(metapage, BTREE_METAPAGE);
+	smgrwrite(index->rd_smgr, MAIN_FORKNUM, BTREE_METAPAGE,
+			  (char *) metapage, true);
+	log_newpage(&index->rd_smgr->smgr_rnode.node, MAIN_FORKNUM,
+				BTREE_METAPAGE, metapage, true);
+
+	/*
+	 * An immediate sync is required even if we xlog'd the page, because the
+	 * write did not go through shared_buffers and therefore a concurrent
+	 * checkpoint may have moved the redo pointer past our xlog record.
+	 */
+	smgrimmedsync(index->rd_smgr, MAIN_FORKNUM);
+	return (IndexBuildResult *) palloc0(sizeof(IndexBuildResult));
+}
+
 static bool
 lsm3_dummy_insert(Relation rel, Datum *values, bool *isnull,
 				  ItemPointer ht_ctid, Relation heapRel,
@@ -617,7 +648,7 @@ lsm3_btree_wrapper(PG_FUNCTION_ARGS)
 	amroutine->amparallelvacuumoptions = 0;
 	amroutine->amkeytype = InvalidOid;
 
-	amroutine->ambuild = btbuild;
+	amroutine->ambuild = lsm3_build_empty;
 	amroutine->ambuildempty = btbuildempty;
 	amroutine->aminsert = lsm3_dummy_insert;
 	amroutine->ambulkdelete = btbulkdelete;
@@ -660,7 +691,7 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 	)
 {
     Node *parseTree = plannedStmt->utilityStmt;
-	Lsm3Entry = NULL;
+	Lsm3Entry = NULL; /* Reset entry to check it after utility statement execution */
 	(PreviousProcessUtilityHook ? PreviousProcessUtilityHook : standard_ProcessUtility)
 		(plannedStmt,
 		 queryString,
@@ -689,10 +720,10 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 											false,
 											false,
 											false,
-											true,
+											false,
 											true).objectId;
 
-			/*  Mark top index as invlid to prevent planner from using it in queries */
+			/*  Mark top index as invalid to prevent planner from using it in queries */
 			index_set_state_flags(Lsm3Entry->top[i], INDEX_DROP_CLEAR_VALID);
 		}
 		stmt->accessMethod = originAccessMethod;
