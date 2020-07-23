@@ -5,6 +5,7 @@
 #include "access/nbtree.h"
 #include "access/table.h"
 #include "access/relscan.h"
+#include "access/xact.h"
 #include "commands/defrem.h"
 #include "funcapi.h"
 #include "utils/rel.h"
@@ -49,7 +50,7 @@ static shmem_startup_hook_type  PreviousShmemStartupHook = NULL;
 
 /* Lsm3 GUCs */
 static int Lsm3MaxIndexes;
-static int Lsm3TopIndexHeight;
+static int Lsm3MaxTopIndexSize;
 
 /* Background worker termination flag */
 static volatile bool Lsm3Cancel;
@@ -86,28 +87,18 @@ lsm3_init_entry(Lsm3DictEntry* entry, Oid heap_oid)
 	entry->top[0] = entry->top[1] = InvalidOid;
 	entry->access_count[0] = entry->access_count[1] = 0;
 	entry->heap = heap_oid;
+	entry->dbId = MyDatabaseId;
+	entry->userId = GetUserId();
 }
 
-/* Get B-Tree height */
-static int
-lsm3_get_height(Relation index)
+/* Get B-Tree index size (number of blocks) */
+static BlockNumber
+lsm3_get_index_size(Oid relid)
 {
-	Buffer	buffer = ReadBuffer(index, 0);
-	Page	page = BufferGetPage(buffer);
-	BTMetaPageData *metad = BTPageGetMeta(page);
-	int		height = metad->btm_level;
-	ReleaseBuffer(buffer);
-	return height;
-}
-
-/* Get B-Tree height given index Oid */
-static int
-lsm3_get_height_by_oid(Oid relid)
-{
-	Relation index = index_open(relid, AccessShareLock);
-	int height = lsm3_get_height(index);
-	index_close(index, AccessShareLock);
-	return height;
+       Relation index = index_open(relid, AccessShareLock);
+       BlockNumber size = RelationGetNumberOfBlocks(index);
+	   index_close(index, AccessShareLock);
+       return size;
 }
 
 /* Lookup or create Lsm3 control data for this index */
@@ -138,7 +129,7 @@ lsm3_get_entry(Relation index)
 				elog(ERROR, "Lsm3: failed to lookup %s index", topidxname);
 			}
 		}
-		entry->active_index = lsm3_get_height_by_oid(entry->top[0]) >= lsm3_get_height_by_oid(entry->top[1]) ? 0 : 1;
+		entry->active_index = lsm3_get_index_size(entry->top[0]) >= lsm3_get_index_size(entry->top[1]) ? 0 : 1;
 	}
 	LWLockRelease(Lsm3DictLock);
 	return entry;
@@ -155,12 +146,13 @@ lsm3_launch_bgworker(Lsm3DictEntry* entry)
 	MemSet(&worker, 0, sizeof(worker));
 	snprintf(worker.bgw_name, sizeof(worker.bgw_name), "lsm3-merger-%d", entry->base);
 	snprintf(worker.bgw_type, sizeof(worker.bgw_type), "lsm3-merger-%d", entry->base);
-	worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
 	worker.bgw_start_time = BgWorkerStart_ConsistentState;
 	worker.bgw_restart_time = BGW_NEVER_RESTART;
 	strcpy(worker.bgw_function_name, "lsm3_merger_main");
-	strcpy(worker.bgw_library_name, "postgres");
+	strcpy(worker.bgw_library_name, "lsm3");
 	worker.bgw_main_arg = PointerGetDatum(entry);
+	worker.bgw_notify_pid = MyProcPid;
 
 	if (!RegisterDynamicBackgroundWorker(&worker, &handle))
 	{
@@ -171,9 +163,14 @@ lsm3_launch_bgworker(Lsm3DictEntry* entry)
 		elog(ERROR, "Lsm3: startup of background worker is failed");
 	}
 	entry->merger = BackendPidGetProc(bgw_pid);
+	for (int n_attempts = 0; entry->merger == NULL || n_attempts < 10; n_attempts++)
+	{
+		pg_usleep(1000); /* wait background worker to be registered in procarray */
+		entry->merger = BackendPidGetProc(bgw_pid);
+	}
 	if (entry->merger == NULL)
 	{
-		elog(ERROR, "Lsm3: background worker is crashed");
+		elog(ERROR, "Lsm3: background worker %d is crashed", bgw_pid);
 	}
 }
 
@@ -205,17 +202,21 @@ lsm3_merge_indexes(Oid dst_oid, Oid src_oid, Oid heap_oid)
 	Relation top_index = index_open(src_oid, AccessShareLock);
 	Relation heap = table_open(heap_oid, AccessShareLock);
 	Relation base_index = index_open(dst_oid, RowExclusiveLock);
-	IndexScanDesc scan = btbeginscan(top_index, 0, 0);
+	IndexScanDesc scan;
 	bool ok;
+	Oid  save_am = base_index->rd_rel->relam;
+
+	base_index->rd_rel->relam = BTREE_AM_OID;
+	scan = index_beginscan(heap, top_index, SnapshotAny, 0, 0);
 	scan->xs_want_itup = true;
+	btrescan(scan, NULL, 0, 0, 0);
+
 	for (ok = _bt_first(scan, ForwardScanDirection); ok; ok = _bt_next(scan, ForwardScanDirection))
 	{
-		if (!_bt_doinsert(base_index, scan->xs_itup, false, heap)) /* lsm3 index is not unique so need not to heck for duplicates */
-		{
-			elog(ERROR, "Lsm3: failed to insert tuple in base index");
-		}
+		_bt_doinsert(base_index, scan->xs_itup, false, heap); /* lsm3 index is not unique so need not to heck for duplicates */
 	}
-	btendscan(scan);
+	index_endscan(scan);
+	base_index->rd_rel->relam = save_am;
 	index_close(top_index, AccessShareLock);
 	index_close(base_index, RowExclusiveLock);
 	table_close(heap, AccessShareLock);
@@ -232,14 +233,14 @@ lsm3_merger_main(Datum arg)
 	pqsignal(SIGQUIT, lsm3_merge_cancel);
 	pqsignal(SIGTERM, lsm3_merge_cancel);
 
-	InitPostgres(NULL, InvalidOid, NULL, InvalidOid, NULL, false);
+	/* We're now ready to receive signals */
+	BackgroundWorkerUnblockSignals();
+
+	BackgroundWorkerInitializeConnectionByOid(entry->dbId, entry->userId, 0);
 
 	appname = psprintf("lsm3 merger for %d", entry->base);
 	pgstat_report_appname(appname);
 	pfree(appname);
-
-	/* We're now ready to receive signals */
-	BackgroundWorkerUnblockSignals();
 
 	while (!Lsm3Cancel)
 	{
@@ -266,11 +267,15 @@ lsm3_merger_main(Datum arg)
 
 		if (merge_index >= 0)
 		{
-			pgstat_report_activity(STATE_RUNNING, "merging");
-			lsm3_merge_indexes(entry->base, entry->top[merge_index], entry->heap);
+			StartTransactionCommand();
+			{
+				pgstat_report_activity(STATE_RUNNING, "merging");
+				lsm3_merge_indexes(entry->base, entry->top[merge_index], entry->heap);
 
-			pgstat_report_activity(STATE_RUNNING, "truncate");
-			lsm3_truncate_index(entry->top[merge_index], entry->heap);
+				pgstat_report_activity(STATE_RUNNING, "truncate");
+				lsm3_truncate_index(entry->top[merge_index], entry->heap);
+			}
+			CommitTransactionCommand();
 
 			SpinLockAcquire(&entry->spinlock);
 			entry->merge_in_progress = false; /* mark merge as completed */
@@ -287,6 +292,9 @@ lsm3_build_sortkeys(Relation index)
 	int	keysz = IndexRelationGetNumberOfKeyAttributes(index);
 	SortSupport	sortKeys = (SortSupport) palloc0(keysz * sizeof(SortSupportData));
 	BTScanInsert inskey = _bt_mkscankey(index, NULL);
+	Oid          save_am = index->rd_rel->relam;
+
+	index->rd_rel->relam = BTREE_AM_OID;
 
 	for (int i = 0; i < keysz; i++)
 	{
@@ -309,6 +317,7 @@ lsm3_build_sortkeys(Relation index)
 
 		PrepareSortSupportFromIndexRel(index, strategy, sortKey);
 	}
+	index->rd_rel->relam = save_am;
 	return sortKeys;
 }
 
@@ -344,10 +353,18 @@ lsm3_compare_index_tuples(IndexScanDesc scan1, IndexScanDesc scan2, SortSupport 
 static IndexBuildResult *
 lsm3_build(Relation heap, Relation index, IndexInfo *indexInfo)
 {
+	Oid save_am = index->rd_rel->relam;
+	IndexBuildResult * result;
+
 	LWLockAcquire(Lsm3DictLock, LW_EXCLUSIVE); /* Obtain exclusive lock on dictionary: it will be released in utility hook */
 	Lsm3Entry = hash_search(Lsm3Dict, &RelationGetRelid(index), HASH_ENTER, NULL); /* Setting Lsm3Entry indicates to utility hook that Lsm3 index was created */
 	lsm3_init_entry(Lsm3Entry, RelationGetRelid(heap));
-	return btbuild(heap, index, indexInfo);
+
+	index->rd_rel->relam = BTREE_AM_OID;
+	result = btbuild(heap, index, indexInfo);
+	index->rd_rel->relam = save_am;
+
+	return result;
 }
 
 /* Insert in active top index, on overflow swap active indexes and initiate merge to base index */
@@ -358,10 +375,12 @@ lsm3_insert(Relation rel, Datum *values, bool *isnull,
 			IndexInfo *indexInfo)
 {
 	Lsm3DictEntry* entry = lsm3_get_entry(rel);
-	bool ok;
+
 	int active_index;
 	uint64 n_merges; /* used to check if merge was initiated by somebody else */
 	Relation index;
+	Oid  save_am;
+	bool overflow;
 
 	/* Obtain current active index and increment access counter under spinlock */
 	SpinLockAcquire(&entry->spinlock);
@@ -372,37 +391,41 @@ lsm3_insert(Relation rel, Datum *values, bool *isnull,
 
 	/* Do insert in top index */
 	index = index_open(entry->top[active_index], RowExclusiveLock);
-	ok = btinsert(index, values, isnull, ht_ctid, heapRel, checkUnique, indexInfo);
+	index->rd_rel->relam = BTREE_AM_OID;
+	save_am = index->rd_rel->relam;
+	btinsert(index, values, isnull, ht_ctid, heapRel, checkUnique, indexInfo);
 	index_close(index, RowExclusiveLock);
+	index->rd_rel->relam = save_am;
 
-	if (ok)
+	overflow = !entry->merge_in_progress /* do not check for overflow if merge was already initiated */
+		&& (entry->n_inserts % LSM3_CHECK_TOP_INDEX_SIZE_PERIOD) == 0 /* perform check only each N-th insert  */
+		&& RelationGetNumberOfBlocks(rel)*(BLCKSZ/1024) > Lsm3MaxTopIndexSize;
+	SpinLockAcquire(&entry->spinlock);
+	/* If merge was not initiated before by somebody else, then do it */
+	if (overflow && !entry->merge_in_progress && entry->n_merges == n_merges)
 	{
-		/* Otimization: do not check for overflow if merge was already initiated */
-		bool overflow = !entry->merge_in_progress && lsm3_get_height(rel) > Lsm3TopIndexHeight;
-		SpinLockAcquire(&entry->spinlock);
-		/* If merge was not initiated before by somebody else, then do it */
-		if (overflow && !entry->merge_in_progress && entry->n_merges == n_merges)
-		{
-			Assert(entry->active_index == active_index);
-			entry->merge_in_progress = true;
-			entry->active_index ^= 1; /* swap top indexes */
-			entry->n_merges += 1;
-		}
-		Assert(entry->access_count[active_index] > 0);
-		entry->access_count[active_index] -= 1;
-		/* If all inserts in previous active index are completed then we can start merge */
-		if (entry->merge_in_progress && entry->active_index != active_index && entry->access_count[active_index] == 0)
-		{
-			entry->start_merge = true;
-			if (entry->merger == NULL) /* lazy start of bgworker */
-			{
-				lsm3_launch_bgworker(entry);
-			}
-			SetLatch(&entry->merger->procLatch);
-		}
-		SpinLockRelease(&entry->spinlock);
+		Assert(entry->active_index == active_index);
+		entry->merge_in_progress = true;
+		entry->active_index ^= 1; /* swap top indexes */
+		entry->n_merges += 1;
 	}
-	return ok;
+	Assert(entry->access_count[active_index] > 0);
+	entry->access_count[active_index] -= 1;
+	entry->n_inserts += 1;
+	/* If all inserts in previous active index are completed then we can start merge */
+	if (entry->merge_in_progress && entry->active_index != active_index && entry->access_count[active_index] == 0)
+	{
+		elog(LOG, "Initiate merge of index %s", RelationGetRelationName(index));
+		entry->start_merge = true;
+		if (entry->merger == NULL) /* lazy start of bgworker */
+		{
+			lsm3_launch_bgworker(entry);
+		}
+		SetLatch(&entry->merger->procLatch);
+	}
+	SpinLockRelease(&entry->spinlock);
+
+	return false;
 }
 
 static IndexScanDesc
@@ -431,6 +454,7 @@ lsm3_beginscan(Relation rel, int nkeys, int norderbys)
 	{
 		so->eof[i] = false;
 		so->scan[i]->xs_want_itup = true;
+		so->scan[i]->parallel_scan = NULL;
 	}
 	scan->opaque = so;
 
@@ -476,6 +500,7 @@ lsm3_gettuple(IndexScanDesc scan, ScanDirection dir)
 	for (int i = 0; i < 3; i++)
 	{
 		BTScanOpaque bto = (BTScanOpaque)so->scan[i]->opaque;
+		so->scan[i]->xs_snapshot = scan->xs_snapshot;
 		if (!so->eof[i] && !BTScanPosIsValid(bto->currPos))
 		{
 			so->eof[i] = !_bt_first(so->scan[i], dir);
@@ -517,12 +542,11 @@ static int64
 lsm3_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 {
 	Lsm3ScanOpaque* so = (Lsm3ScanOpaque*)scan->opaque;
-	int64 ntids = btgetbitmap(so->scan[2], tbm);
-	for (int i = 0; i < 2; i++)
+	int64 ntids = 0;
+	for (int i = 0; i < 3; i++)
 	{
-		Relation top_index = index_open(so->entry->top[i], AccessShareLock);
+		so->scan[i]->xs_snapshot = scan->xs_snapshot;
 		ntids += btgetbitmap(so->scan[i], tbm);
-		index_close(top_index, AccessShareLock);
 	}
 	return ntids;
 }
@@ -588,9 +612,11 @@ lsm3_build_empty(Relation heap, Relation index, IndexInfo *indexInfo)
 {
 	Page		metapage;
 
+	RelationOpenSmgr(index);
+
 	/* Construct metapage. */
 	metapage = (Page) palloc(BLCKSZ);
-	_bt_initmetapage(metapage, P_NONE, 0, _bt_allequalimage(index, false));
+	_bt_initmetapage(metapage, BTREE_METAPAGE, 0, _bt_allequalimage(index, false));
 
 	/*
 	 * Write the page and log it.  It might seem that an immediate sync would
@@ -600,8 +626,8 @@ lsm3_build_empty(Relation heap, Relation index, IndexInfo *indexInfo)
 	 * this even when wal_level=minimal.
 	 */
 	PageSetChecksumInplace(metapage, BTREE_METAPAGE);
-	smgrwrite(index->rd_smgr, MAIN_FORKNUM, BTREE_METAPAGE,
-			  (char *) metapage, true);
+	smgrextend(index->rd_smgr, MAIN_FORKNUM, BTREE_METAPAGE,
+			   (char *) metapage, true);
 	log_newpage(&index->rd_smgr->smgr_rnode.node, MAIN_FORKNUM,
 				BTREE_METAPAGE, metapage, true);
 
@@ -611,6 +637,8 @@ lsm3_build_empty(Relation heap, Relation index, IndexInfo *indexInfo)
 	 * checkpoint may have moved the redo pointer past our xlog record.
 	 */
 	smgrimmedsync(index->rd_smgr, MAIN_FORKNUM);
+	RelationCloseSmgr(index);
+
 	return (IndexBuildResult *) palloc0(sizeof(IndexBuildResult));
 }
 
@@ -620,7 +648,7 @@ lsm3_dummy_insert(Relation rel, Datum *values, bool *isnull,
 				  IndexUniqueCheck checkUnique,
 				  IndexInfo *indexInfo)
 {
-	return true;
+	return false;
 }
 
 Datum
@@ -712,7 +740,7 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 		{
 			stmt->accessMethod = "lsm3_btree_wrapper";
 			stmt->idxname = psprintf("%s_top%d", originIndexName, i);
-			Lsm3Entry->top[i] = DefineIndex(Lsm3Entry->base,
+			Lsm3Entry->top[i] = DefineIndex(Lsm3Entry->heap,
 											stmt,
 											InvalidOid,
 											InvalidOid,
@@ -722,8 +750,14 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 											false,
 											false,
 											true).objectId;
-
-			/*  Mark top index as invalid to prevent planner from using it in queries */
+		}
+		if (ActiveSnapshotSet())
+			PopActiveSnapshot();
+		CommitTransactionCommand();
+		StartTransactionCommand();
+		/*  Mark top index as invalid to prevent planner from using it in queries */
+		for (i = 0; i < 2; i++)
+		{
 			index_set_state_flags(Lsm3Entry->top[i], INDEX_DROP_CLEAR_VALID);
 		}
 		stmt->accessMethod = originAccessMethod;
@@ -739,15 +773,15 @@ _PG_init(void)
 	{
 		elog(ERROR, "Lsm3: this extension should be loaded via shared_preload_libraries");
 	}
-	DefineCustomIntVariable("lsm3.top_index_height",
-                            "Maximal height top index B-Tree.",
+	DefineCustomIntVariable("lsm3.max_top_index_size",
+                            "Maximal size of top index B-Tree (kb)",
 							NULL,
-							&Lsm3TopIndexHeight,
-							3,
-							1,
+							&Lsm3MaxTopIndexSize,
+							64*1024,
+							BLCKSZ/1024,
 							INT_MAX,
 							PGC_POSTMASTER,
-							0,
+							GUC_UNIT_KB,
 							NULL,
 							NULL,
 							NULL);

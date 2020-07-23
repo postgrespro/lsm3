@@ -1,5 +1,12 @@
 /*
- * Control structure for Lsm3 index located in sharedmemory
+ * It is too expensive to check index size at each insert because it requires traverse of all index file segments and calling lseek for each.
+ * But we do not need precise size, so it is enough to do it at each n-th insert. The lagest B-Tree key size is abut 2kb,
+ * so with N=64K in the worst case error will be less than 128Mb and for 32-bit key just 1Mb.
+ */
+#define LSM3_CHECK_TOP_INDEX_SIZE_PERIOD (64*1024) /* should be power of two */
+
+/*
+ * Control structure for Lsm3 index located in shared memory
  */
 typedef struct
 {
@@ -8,10 +15,13 @@ typedef struct
 	Oid top[2]; /* Oids of two top indexes */
 	int access_count[2]; /* Access counter for top indexes */
 	int active_index; /* Index used for insert */
-	uint64 n_merges;  /* Number of performed merges */
+	uint64 n_merges;  /* Number of performed merges since database open */
+	uint64 n_inserts; /* Number of performed inserts since database open  */
 	bool start_merge; /* Start merging of top index with base index */
 	bool merge_in_progress; /* Overflow of top index intiate merge process */
 	PGPROC* merger;   /* Merger background worker */
+	Oid     dbId;     /* user ID (for background worker) */
+	Oid     userId;   /* database Id (for background worker) */
 	slock_t spinlock; /* Spinlock to synchronize access */
 } Lsm3DictEntry;
 

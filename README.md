@@ -24,8 +24,5 @@ Current restrictions of `Lsm3`:
 
 `Lsm3` extension can be configured using the following parameters:
 - `lsm3.max_indexes`: maximal number of Lsm3 indexes (default 1024).
-- `lsm3.top_index_height`: Maximal height top index B-Tree (default 3).
+- `lsm3.max_top_index_size`: Maximal size (kb) of top index (default 64Mb).
 
-So size of top index is limited by height of B-Tree.
-Maximal size used by top index can be estimated as `(BLCKSZ << (lsm3.top_index_height-1))` where
-`BLCKSZ` is size of Postgres page (4096 by default).
