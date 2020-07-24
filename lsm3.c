@@ -84,6 +84,7 @@ lsm3_init_entry(Lsm3DictEntry* entry, Oid heap_oid)
 	entry->merge_in_progress = false;
 	entry->start_merge = false;
 	entry->n_merges = 0;
+	entry->n_inserts = 0;
 	entry->top[0] = entry->top[1] = InvalidOid;
 	entry->access_count[0] = entry->access_count[1] = 0;
 	entry->heap = heap_oid;
@@ -210,10 +211,25 @@ lsm3_merge_indexes(Oid dst_oid, Oid src_oid, Oid heap_oid)
 	scan = index_beginscan(heap, top_index, SnapshotAny, 0, 0);
 	scan->xs_want_itup = true;
 	btrescan(scan, NULL, 0, 0, 0);
-
 	for (ok = _bt_first(scan, ForwardScanDirection); ok; ok = _bt_next(scan, ForwardScanDirection))
 	{
-		_bt_doinsert(base_index, scan->xs_itup, false, heap); /* lsm3 index is not unique so need not to heck for duplicates */
+		IndexTuple itup = scan->xs_itup;
+		if (BTreeTupleIsPosting(itup))
+		{
+			ItemPointerData save_tid = itup->t_tid;
+			unsigned short save_info = itup->t_info;
+			itup->t_info = (save_info & ~(INDEX_SIZE_MASK | INDEX_ALT_TID_MASK)) + BTreeTupleGetPostingOffset(itup);
+			itup->t_tid = scan->xs_heaptid;
+			_bt_doinsert(base_index, itup, false, heap); /* lsm3 index is not unique so need not to heck for duplica
+tes */
+			itup->t_tid = save_tid;
+			itup->t_info = save_info;
+		}
+		else
+		{
+			_bt_doinsert(base_index, itup, false, heap); /* lsm3 index is not unique so need not to heck for duplica
+tes */
+		}
 	}
 	index_endscan(scan);
 	base_index->rd_rel->relam = save_am;
@@ -399,7 +415,8 @@ lsm3_insert(Relation rel, Datum *values, bool *isnull,
 
 	overflow = !entry->merge_in_progress /* do not check for overflow if merge was already initiated */
 		&& (entry->n_inserts % LSM3_CHECK_TOP_INDEX_SIZE_PERIOD) == 0 /* perform check only each N-th insert  */
-		&& RelationGetNumberOfBlocks(rel)*(BLCKSZ/1024) > Lsm3MaxTopIndexSize;
+		&& RelationGetNumberOfBlocks(index)*(BLCKSZ/1024) > Lsm3MaxTopIndexSize;
+
 	SpinLockAcquire(&entry->spinlock);
 	/* If merge was not initiated before by somebody else, then do it */
 	if (overflow && !entry->merge_in_progress && entry->n_merges == n_merges)
@@ -612,11 +629,11 @@ lsm3_build_empty(Relation heap, Relation index, IndexInfo *indexInfo)
 {
 	Page		metapage;
 
-	RelationOpenSmgr(index);
-
 	/* Construct metapage. */
 	metapage = (Page) palloc(BLCKSZ);
 	_bt_initmetapage(metapage, BTREE_METAPAGE, 0, _bt_allequalimage(index, false));
+
+	RelationOpenSmgr(index);
 
 	/*
 	 * Write the page and log it.  It might seem that an immediate sync would
