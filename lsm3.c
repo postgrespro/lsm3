@@ -34,6 +34,8 @@ PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(lsm3_handler);
 PG_FUNCTION_INFO_V1(lsm3_btree_wrapper);
+PG_FUNCTION_INFO_V1(lsm3_get_merge_count);
+
 extern void	_PG_init(void);
 extern void	_PG_fini(void);
 
@@ -191,6 +193,7 @@ lsm3_truncate_index(Oid index_oid, Oid heap_oid)
 	Relation heap = table_open(heap_oid, AccessShareLock); /* heap is actually not used, because we will not load data to top indexes */
 	IndexInfo* indexInfo = BuildDummyIndexInfo(index);
 	RelationTruncate(index, 0);
+	elog(LOG, "Lsm3: truncate index %s", RelationGetRelationName(index));
 	index_build(heap, index, indexInfo, true, false);
 	index_close(index, AccessExclusiveLock);
 	table_close(heap, AccessShareLock);
@@ -206,6 +209,8 @@ lsm3_merge_indexes(Oid dst_oid, Oid src_oid, Oid heap_oid)
 	IndexScanDesc scan;
 	bool ok;
 	Oid  save_am = base_index->rd_rel->relam;
+
+	elog(LOG, "Lsm3: merge index %s", RelationGetRelationName(top_index));
 
 	base_index->rd_rel->relam = BTREE_AM_OID;
 	scan = index_beginscan(heap, top_index, SnapshotAny, 0, 0);
@@ -432,7 +437,6 @@ lsm3_insert(Relation rel, Datum *values, bool *isnull,
 	/* If all inserts in previous active index are completed then we can start merge */
 	if (entry->merge_in_progress && entry->active_index != active_index && entry->access_count[active_index] == 0)
 	{
-		elog(LOG, "Initiate merge of index %s", RelationGetRelationName(index));
 		entry->start_merge = true;
 		if (entry->merger == NULL) /* lazy start of bgworker */
 		{
@@ -499,6 +503,10 @@ lsm3_endscan(IndexScanDesc scan)
 	for (int i = 0; i < 3; i++)
 	{
 		btendscan(so->scan[i]);
+		if (i < 2)
+		{
+			index_close(so->top_index[i], AccessShareLock);
+		}
 	}
 	pfree(so);
 }
@@ -756,7 +764,7 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 		for (i = 0; i < 2; i++)
 		{
 			stmt->accessMethod = "lsm3_btree_wrapper";
-			stmt->idxname = psprintf("%s_top%d", originIndexName, i);
+			stmt->idxname = psprintf("%s_top%d", get_rel_name(Lsm3Entry->base), i);
 			Lsm3Entry->top[i] = DefineIndex(Lsm3Entry->heap,
 											stmt,
 											InvalidOid,
@@ -829,5 +837,18 @@ void _PG_fini(void)
 {
     ProcessUtility_hook = PreviousProcessUtilityHook;
 	shmem_startup_hook = PreviousShmemStartupHook;
+}
+
+Datum
+lsm3_get_merge_count(PG_FUNCTION_ARGS)
+{
+	Oid	relid = PG_GETARG_OID(0);
+	Relation index = index_open(relid, AccessShareLock);
+	Lsm3DictEntry* entry = lsm3_get_entry(index);
+	index_close(index, AccessShareLock);
+	if (entry == NULL)
+		PG_RETURN_NULL();
+	else
+		PG_RETURN_INT64(entry->n_merges);
 }
 

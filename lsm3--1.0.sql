@@ -785,3 +785,6 @@ CREATE OPERATOR CLASS uuid_ops DEFAULT
 	FUNCTION 1  uuid_cmp(uuid,uuid),
 	FUNCTION 2  uuid_sortsupport(internal),
     FUNCTION 4  btequalimage(oid);
+
+CREATE FUNCTION lsm3_get_merge_count(index regclass) returns bigint
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT PARALLEL RESTRICTED;
