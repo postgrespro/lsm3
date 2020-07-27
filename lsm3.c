@@ -24,6 +24,8 @@
 #include "executor/executor.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
+#include "storage/lock.h"
+#include "storage/lmgr.h"
 #include "storage/procarray.h"
 
 #include "lsm3.h"
@@ -45,10 +47,12 @@ extern void lsm3_merger_main(Datum arg);
 static Lsm3DictEntry* Lsm3Entry;
 static HTAB*          Lsm3Dict;
 static LWLock*        Lsm3DictLock;
+static List*          Lsm3ReleasedLocks;
 
 /* Lsm3 kooks */
 static ProcessUtility_hook_type PreviousProcessUtilityHook = NULL;
 static shmem_startup_hook_type  PreviousShmemStartupHook = NULL;
+static ExecutorFinish_hook_type PreviousExecutorFinish = NULL;
 
 /* Lsm3 GUCs */
 static int Lsm3MaxIndexes;
@@ -434,15 +438,29 @@ lsm3_insert(Relation rel, Datum *values, bool *isnull,
 	Assert(entry->access_count[active_index] > 0);
 	entry->access_count[active_index] -= 1;
 	entry->n_inserts += 1;
-	/* If all inserts in previous active index are completed then we can start merge */
-	if (entry->merge_in_progress && entry->active_index != active_index && entry->access_count[active_index] == 0)
+	if (entry->merge_in_progress)
 	{
-		entry->start_merge = true;
-		if (entry->merger == NULL) /* lazy start of bgworker */
+		LOCKTAG		tag;
+		SET_LOCKTAG_RELATION(tag,
+							 MyDatabaseId,
+							 entry->top[1-active_index]);
+		/* Holding lock on non-ative index prevent merger bgworker from truncation this index */
+		if (LockHeldByMe(&tag, RowExclusiveLock))
 		{
-			lsm3_launch_bgworker(entry);
+			LockRelease(&tag, RowExclusiveLock, false);
+			Lsm3ReleasedLocks = lappend_oid(Lsm3ReleasedLocks, entry->top[1-active_index]);
 		}
-		SetLatch(&entry->merger->procLatch);
+
+		/* If all inserts in previous active index are completed then we can start merge */
+		if (entry->active_index != active_index && entry->access_count[active_index] == 0)
+		{
+			entry->start_merge = true;
+			if (entry->merger == NULL) /* lazy start of bgworker */
+			{
+				lsm3_launch_bgworker(entry);
+			}
+			SetLatch(&entry->merger->procLatch);
+		}
 	}
 	SpinLockRelease(&entry->spinlock);
 
@@ -791,6 +809,32 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 	}
 }
 
+/*
+ * Executor sinish hookto reclaim released locks on non-active top indexes
+ * to avoid "you don't own a lock of type RowExclusiveLock" warning
+ */
+static void
+lsm3_executor_finish(QueryDesc *queryDesc)
+{
+	if (Lsm3ReleasedLocks)
+	{
+		ListCell* cell;
+		foreach (cell, Lsm3ReleasedLocks)
+		{
+			Oid indexOid = lfirst_oid(cell);
+			LockRelationOid(indexOid, RowExclusiveLock);
+		}
+		list_free(Lsm3ReleasedLocks);
+		Lsm3ReleasedLocks = NULL;
+	}
+	if (PreviousExecutorFinish)
+		PreviousExecutorFinish(queryDesc);
+	else
+		standard_ExecutorFinish(queryDesc);
+
+}
+
+
 void
 _PG_init(void)
 {
@@ -829,8 +873,12 @@ _PG_init(void)
 
 	PreviousShmemStartupHook = shmem_startup_hook;
 	shmem_startup_hook = lsm3_shmem_startup;
+
 	PreviousProcessUtilityHook = ProcessUtility_hook;
     ProcessUtility_hook = lsm3_process_utility;
+
+	PreviousExecutorFinish = ExecutorFinish_hook;
+	ExecutorFinish_hook = lsm3_executor_finish;
 }
 
 void _PG_fini(void)
