@@ -30,9 +30,21 @@ typedef struct
  */
 typedef struct
 {
-	Lsm3DictEntry* entry;    /* Lsm3 control structure */
+	Lsm3DictEntry* entry;      /* Lsm3 control structure */
 	Relation 	   top_index[2]; /* Opened top index relations */
-	SortSupport    sortKeys; /* Context for comparing index tuples */
-	IndexScanDesc  scan[3];  /* Scan descriptors for two top indexes and base index */
-	bool           eof[3];   /* Indicators that end of index was reached */
+	SortSupport    sortKeys;   /* Context for comparing index tuples */
+	IndexScanDesc  scan[3];    /* Scan descriptors for two top indexes and base index */
+	bool           eof[3];     /* Indicators that end of index was reached */
+	bool           unique;     /* Whether index is "unique" and we can stop scan after locating first occurrence */
+	int            curr_index; /* Index from which last tuple was selected (or -1 if none) */
 } Lsm3ScanOpaque;
+
+/* Lsm3 index options */
+typedef struct
+{
+	int32		vl_len_;		/* Varlena header (do not touch directly!) */
+	bool        unique;			/* Index may not contain duplicates. We prohibit unique constraint for Lsm3 index
+                                 * because it can not be enforced. But presence of this index option allows to optimize
+								 * index lookup: if key is found in active top index, do not search other two indexes.
+                                 */
+} Lsm3Options;

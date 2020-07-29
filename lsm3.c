@@ -49,6 +49,9 @@ static HTAB*          Lsm3Dict;
 static LWLock*        Lsm3DictLock;
 static List*          Lsm3ReleasedLocks;
 
+/* Kind of relation optioms for Lsm3 index */
+static relopt_kind    Lsm3ReloptKind;
+
 /* Lsm3 kooks */
 static ProcessUtility_hook_type PreviousProcessUtilityHook = NULL;
 static shmem_startup_hook_type  PreviousShmemStartupHook = NULL;
@@ -245,6 +248,18 @@ tes */
 	index_close(top_index, AccessShareLock);
 	index_close(base_index, RowExclusiveLock);
 	table_close(heap, AccessShareLock);
+}
+
+/* Lsm3 index options.
+ */
+static bytea *
+lsm3_options(Datum reloptions, bool validate)
+{
+	static const relopt_parse_elt tab[] = {
+		{"unique", RELOPT_TYPE_BOOL, offsetof(Lsm3Options, unique)}
+	};
+	return (bytea *) build_reloptions(reloptions, validate, Lsm3ReloptKind,
+									  sizeof(Lsm3Options), tab, lengthof(tab));
 }
 
 /* Main function of merger bgwroker */
@@ -495,6 +510,8 @@ lsm3_beginscan(Relation rel, int nkeys, int norderbys)
 		so->scan[i]->xs_want_itup = true;
 		so->scan[i]->parallel_scan = NULL;
 	}
+	so->unique = rel->rd_options ? ((Lsm3Options*)rel->rd_options)->unique : false;
+	so->curr_index = -1;
 	scan->opaque = so;
 
 	return scan;
@@ -506,6 +523,7 @@ lsm3_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 {
 	Lsm3ScanOpaque* so = (Lsm3ScanOpaque*) scan->opaque;
 
+	so->curr_index = -1;
 	for (int i = 0; i < 3; i++)
 	{
 		btrescan(so->scan[i], scankey, nscankeys, orderbys, norderbys);
@@ -535,18 +553,38 @@ lsm3_gettuple(IndexScanDesc scan, ScanDirection dir)
 {
 	Lsm3ScanOpaque* so = (Lsm3ScanOpaque*) scan->opaque;
 	int min = -1;
+	int curr = so->curr_index;
+	/* We start with active top index, then merging index and last of all: largest base index */
+	int try_index_order[3] = {so->entry->active_index, 1-so->entry->active_index, 2};
 
 	/* btree indexes are never lossy */
 	scan->xs_recheck = false;
-	Assert(!scan->xs_want_itup);
-
-	for (int i = 0; i < 3; i++)
+	if (curr >= 0)
 	{
+		so->eof[curr] = !_bt_next(so->scan[curr], dir); /* move forward current index */
+	}
+
+	for (int j = 0; j < 3; j++)
+	{
+		int i = try_index_order[j];
 		BTScanOpaque bto = (BTScanOpaque)so->scan[i]->opaque;
 		so->scan[i]->xs_snapshot = scan->xs_snapshot;
 		if (!so->eof[i] && !BTScanPosIsValid(bto->currPos))
 		{
 			so->eof[i] = !_bt_first(so->scan[i], dir);
+			if (!so->eof[i] && so->unique && scan->numberOfKeys == scan->indexRelation->rd_index->indnkeyatts)
+			{
+				/* If index can marked as unique and we perform lookup using all index keys,
+				 *  then we can stop after locating first occurrence.
+				 * If make it possible to avoid lookups of all three indexes.
+				 */
+				while (++j < 3) /* prevent search of all remanining indexes */
+				{
+					so->eof[try_index_order[j]] = true;
+				}
+				min = i;
+				break;
+			}
 		}
 		if (!so->eof[i])
 		{
@@ -576,7 +614,10 @@ lsm3_gettuple(IndexScanDesc scan, ScanDirection dir)
 	else
 	{
 		scan->xs_heaptid = so->scan[min]->xs_heaptid; /* copy TID */
-		so->eof[min] = !_bt_next(so->scan[min], dir); /* move forward index with minimal element */
+		if (scan->xs_want_itup) {
+			scan->xs_itup = so->scan[min]->xs_itup;
+		}
+		so->curr_index = min;
 		return true;
 	}
 }
@@ -627,7 +668,7 @@ lsm3_handler(PG_FUNCTION_ARGS)
 	amroutine->amvacuumcleanup = btvacuumcleanup;
 	amroutine->amcanreturn = btcanreturn;
 	amroutine->amcostestimate = btcostestimate;
-	amroutine->amoptions = btoptions;
+	amroutine->amoptions = lsm3_options;
 	amroutine->amproperty = btproperty;
 	amroutine->ambuildphasename = btbuildphasename;
 	amroutine->amvalidate = btvalidate;
@@ -726,7 +767,7 @@ lsm3_btree_wrapper(PG_FUNCTION_ARGS)
 	amroutine->amvacuumcleanup = btvacuumcleanup;
 	amroutine->amcanreturn = btcanreturn;
 	amroutine->amcostestimate = btcostestimate;
-	amroutine->amoptions = btoptions;
+	amroutine->amoptions = lsm3_options;
 	amroutine->amproperty = btproperty;
 	amroutine->ambuildphasename = btbuildphasename;
 	amroutine->amvalidate = btvalidate;
@@ -867,6 +908,11 @@ _PG_init(void)
 							NULL,
 							NULL,
 							NULL);
+
+	Lsm3ReloptKind = add_reloption_kind();
+	add_bool_reloption(Lsm3ReloptKind, "unique",
+					   "Index contains no duplicates",
+					   false, AccessExclusiveLock);
 
 	RequestAddinShmemSpace(hash_estimate_size(Lsm3MaxIndexes, sizeof(Lsm3DictEntry)));
 	RequestNamedLWLockTranche("lsm3", 1);

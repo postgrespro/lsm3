@@ -26,3 +26,13 @@ Current restrictions of `Lsm3`:
 - `lsm3.max_indexes`: maximal number of Lsm3 indexes (default 1024).
 - `lsm3.max_top_index_size`: Maximal size (kb) of top index (default 64Mb).
 
+
+Although unique constraint can not be enforced using Lsm3 index, it is still possible to mark index as unique to
+optimize index search. If index is marked as unique and searched key is found in active
+top index, then lookup in other two indexes is not performed. As far as application is most frequently
+searching for last recently inserted data, we can speedup this search by performing just one index lookup instead of 3.
+Index can be marked as unique using index options:
+ 
+```sql
+create index idx on t using lsm3(id) with (unique=true);
+```
