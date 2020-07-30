@@ -217,7 +217,7 @@ lsm3_merge_indexes(Oid dst_oid, Oid src_oid, Oid heap_oid)
 	bool ok;
 	Oid  save_am = base_index->rd_rel->relam;
 
-	elog(LOG, "Lsm3: merge index %s", RelationGetRelationName(top_index));
+	elog(LOG, "Lsm3: merge top index %s with size %d blocks", RelationGetRelationName(top_index), RelationGetNumberOfBlocks(top_index));
 
 	base_index->rd_rel->relam = BTREE_AM_OID;
 	scan = index_beginscan(heap, top_index, SnapshotAny, 0, 0);
@@ -228,6 +228,14 @@ lsm3_merge_indexes(Oid dst_oid, Oid src_oid, Oid heap_oid)
 		IndexTuple itup = scan->xs_itup;
 		if (BTreeTupleIsPosting(itup))
 		{
+			/* Some dirty coding here related with handling of posting items (index deduplication).
+			 * If index tuple is posting item, we need to transfer it to normal index tuple.
+			 * Posting list is representing by index tuple with INDEX_ALT_TID_MASK bit set in t_info and
+			 * BT_IS_POSTING bit in TID offset, following by array of TIDs.
+			 * We need to store right TID (taken from xs_heaptid) and correct index tuple length
+			 * (not including size of TIDs array), clearing INDEX_ALT_TID_MASK.
+			 * For efficiency reasons let's do it in place, saving and restoring original values after insertion is done.
+			 */
 			ItemPointerData save_tid = itup->t_tid;
 			unsigned short save_info = itup->t_info;
 			itup->t_info = (save_info & ~(INDEX_SIZE_MASK | INDEX_ALT_TID_MASK)) + BTreeTupleGetPostingOffset(itup);
@@ -559,7 +567,8 @@ lsm3_gettuple(IndexScanDesc scan, ScanDirection dir)
 
 	/* btree indexes are never lossy */
 	scan->xs_recheck = false;
-	if (curr >= 0)
+
+	if (curr >= 0) /* lazy advance of current index */
 	{
 		so->eof[curr] = !_bt_next(so->scan[curr], dir); /* move forward current index */
 	}
@@ -574,8 +583,8 @@ lsm3_gettuple(IndexScanDesc scan, ScanDirection dir)
 			so->eof[i] = !_bt_first(so->scan[i], dir);
 			if (!so->eof[i] && so->unique && scan->numberOfKeys == scan->indexRelation->rd_index->indnkeyatts)
 			{
-				/* If index can marked as unique and we perform lookup using all index keys,
-				 *  then we can stop after locating first occurrence.
+				/* If index is marked as unique and we perform lookup using all index keys,
+				 * then we can stop after locating first occurrence.
 				 * If make it possible to avoid lookups of all three indexes.
 				 */
 				while (++j < 3) /* prevent search of all remanining indexes */
@@ -617,7 +626,7 @@ lsm3_gettuple(IndexScanDesc scan, ScanDirection dir)
 		if (scan->xs_want_itup) {
 			scan->xs_itup = so->scan[min]->xs_itup;
 		}
-		so->curr_index = min;
+		so->curr_index = min; /*will be advance at next call of gettuple */
 		return true;
 	}
 }
