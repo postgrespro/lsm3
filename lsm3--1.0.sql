@@ -786,5 +786,6 @@ CREATE OPERATOR CLASS uuid_ops DEFAULT
 	FUNCTION 2  uuid_sortsupport(internal),
     FUNCTION 4  btequalimage(oid);
 
+-- Number of index merges since server start
 CREATE FUNCTION lsm3_get_merge_count(index regclass) returns bigint
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT PARALLEL RESTRICTED;

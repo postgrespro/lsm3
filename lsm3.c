@@ -59,7 +59,7 @@ static ExecutorFinish_hook_type PreviousExecutorFinish = NULL;
 
 /* Lsm3 GUCs */
 static int Lsm3MaxIndexes;
-static int Lsm3MaxTopIndexSize;
+static int Lsm3TopIndexSize;
 
 /* Background worker termination flag */
 static volatile bool Lsm3Cancel;
@@ -85,7 +85,7 @@ lsm3_shmem_startup(void)
 
 /* Initialize Lsm3 control data entry */
 static void
-lsm3_init_entry(Lsm3DictEntry* entry, Oid heap_oid)
+lsm3_init_entry(Lsm3DictEntry* entry, Relation index)
 {
 	SpinLockInit(&entry->spinlock);
 	entry->active_index = 0;
@@ -96,9 +96,10 @@ lsm3_init_entry(Lsm3DictEntry* entry, Oid heap_oid)
 	entry->n_inserts = 0;
 	entry->top[0] = entry->top[1] = InvalidOid;
 	entry->access_count[0] = entry->access_count[1] = 0;
-	entry->heap = heap_oid;
-	entry->dbId = MyDatabaseId;
-	entry->userId = GetUserId();
+	entry->heap = index->rd_index->indrelid;
+	entry->db_id = MyDatabaseId;
+	entry->user_id = GetUserId();
+	entry->top_index_size = index->rd_options ? ((Lsm3Options*)index->rd_options)->top_index_size : 0;
 }
 
 /* Get B-Tree index size (number of blocks) */
@@ -129,7 +130,7 @@ lsm3_get_entry(Relation index)
 	if (!found)
 	{
 		char* relname = RelationGetRelationName(index);
-		lsm3_init_entry(entry, index->rd_index->indrelid);
+		lsm3_init_entry(entry, index);
 		for (int i = 0; i < 2; i++)
 		{
 			char* topidxname = psprintf("%s_top%d", relname, i);
@@ -264,6 +265,7 @@ static bytea *
 lsm3_options(Datum reloptions, bool validate)
 {
 	static const relopt_parse_elt tab[] = {
+		{"top_index_size", RELOPT_TYPE_INT, offsetof(Lsm3Options, top_index_size)},
 		{"unique", RELOPT_TYPE_BOOL, offsetof(Lsm3Options, unique)}
 	};
 	return (bytea *) build_reloptions(reloptions, validate, Lsm3ReloptKind,
@@ -284,7 +286,7 @@ lsm3_merger_main(Datum arg)
 	/* We're now ready to receive signals */
 	BackgroundWorkerUnblockSignals();
 
-	BackgroundWorkerInitializeConnectionByOid(entry->dbId, entry->userId, 0);
+	BackgroundWorkerInitializeConnectionByOid(entry->db_id, entry->user_id, 0);
 
 	appname = psprintf("lsm3 merger for %d", entry->base);
 	pgstat_report_appname(appname);
@@ -406,7 +408,7 @@ lsm3_build(Relation heap, Relation index, IndexInfo *indexInfo)
 
 	LWLockAcquire(Lsm3DictLock, LW_EXCLUSIVE); /* Obtain exclusive lock on dictionary: it will be released in utility hook */
 	Lsm3Entry = hash_search(Lsm3Dict, &RelationGetRelid(index), HASH_ENTER, NULL); /* Setting Lsm3Entry indicates to utility hook that Lsm3 index was created */
-	lsm3_init_entry(Lsm3Entry, RelationGetRelid(heap));
+	lsm3_init_entry(Lsm3Entry, index);
 
 	index->rd_rel->relam = BTREE_AM_OID;
 	result = btbuild(heap, index, indexInfo);
@@ -429,6 +431,7 @@ lsm3_insert(Relation rel, Datum *values, bool *isnull,
 	Relation index;
 	Oid  save_am;
 	bool overflow;
+	int top_index_size = entry->top_index_size ? entry->top_index_size : Lsm3TopIndexSize;
 
 	/* Obtain current active index and increment access counter under spinlock */
 	SpinLockAcquire(&entry->spinlock);
@@ -447,7 +450,7 @@ lsm3_insert(Relation rel, Datum *values, bool *isnull,
 
 	overflow = !entry->merge_in_progress /* do not check for overflow if merge was already initiated */
 		&& (entry->n_inserts % LSM3_CHECK_TOP_INDEX_SIZE_PERIOD) == 0 /* perform check only each N-th insert  */
-		&& RelationGetNumberOfBlocks(index)*(BLCKSZ/1024) > Lsm3MaxTopIndexSize;
+		&& RelationGetNumberOfBlocks(index)*(BLCKSZ/1024) > top_index_size;
 
 	SpinLockAcquire(&entry->spinlock);
 	/* If merge was not initiated before by somebody else, then do it */
@@ -587,6 +590,7 @@ lsm3_gettuple(IndexScanDesc scan, ScanDirection dir)
 				 * then we can stop after locating first occurrence.
 				 * If make it possible to avoid lookups of all three indexes.
 				 */
+				elog(DEBUG1, "Lsm3: lookup %d indexes", j+1);
 				while (++j < 3) /* prevent search of all remanining indexes */
 				{
 					so->eof[try_index_order[j]] = true;
@@ -892,14 +896,14 @@ _PG_init(void)
 	{
 		elog(ERROR, "Lsm3: this extension should be loaded via shared_preload_libraries");
 	}
-	DefineCustomIntVariable("lsm3.max_top_index_size",
-                            "Maximal size of top index B-Tree (kb)",
+	DefineCustomIntVariable("lsm3.top_index_size",
+                            "Size of top index B-Tree (kb)",
 							NULL,
-							&Lsm3MaxTopIndexSize,
+							&Lsm3TopIndexSize,
 							64*1024,
 							BLCKSZ/1024,
 							INT_MAX,
-							PGC_POSTMASTER,
+							PGC_SIGHUP,
 							GUC_UNIT_KB,
 							NULL,
 							NULL,
@@ -922,6 +926,9 @@ _PG_init(void)
 	add_bool_reloption(Lsm3ReloptKind, "unique",
 					   "Index contains no duplicates",
 					   false, AccessExclusiveLock);
+	add_int_reloption(Lsm3ReloptKind, "top_index_size",
+					  "Size of top index (kb)",
+					  0, 0, INT_MAX, AccessExclusiveLock);
 
 	RequestAddinShmemSpace(hash_estimate_size(Lsm3MaxIndexes, sizeof(Lsm3DictEntry)));
 	RequestNamedLWLockTranche("lsm3", 1);

@@ -20,8 +20,9 @@ typedef struct
 	bool start_merge; /* Start merging of top index with base index */
 	bool merge_in_progress; /* Overflow of top index intiate merge process */
 	PGPROC* merger;   /* Merger background worker */
-	Oid     dbId;     /* user ID (for background worker) */
-	Oid     userId;   /* database Id (for background worker) */
+	Oid     db_id;    /* user ID (for background worker) */
+	Oid     user_id;  /* database Id (for background worker) */
+	int     top_index_size; /* Size of top index */
 	slock_t spinlock; /* Spinlock to synchronize access */
 } Lsm3DictEntry;
 
@@ -43,6 +44,7 @@ typedef struct
 typedef struct
 {
 	int32		vl_len_;		/* Varlena header (do not touch directly!) */
+	int         top_index_size; /* Size of top index (overrode lsm3.top_index_size GUC */
 	bool        unique;			/* Index may not contain duplicates. We prohibit unique constraint for Lsm3 index
                                  * because it can not be enforced. But presence of this index option allows to optimize
 								 * index lookup: if key is found in active top index, do not search other two indexes.
