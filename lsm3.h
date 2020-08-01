@@ -17,8 +17,8 @@ typedef struct
 	int active_index; /* Index used for insert */
 	uint64 n_merges;  /* Number of performed merges since database open */
 	uint64 n_inserts; /* Number of performed inserts since database open  */
-	bool start_merge; /* Start merging of top index with base index */
-	bool merge_in_progress; /* Overflow of top index intiate merge process */
+	volatile bool start_merge; /* Start merging of top index with base index */
+	volatile bool merge_in_progress; /* Overflow of top index intiate merge process */
 	PGPROC* merger;   /* Merger background worker */
 	Oid     db_id;    /* user ID (for background worker) */
 	Oid     user_id;  /* database Id (for background worker) */

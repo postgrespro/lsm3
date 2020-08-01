@@ -37,6 +37,8 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(lsm3_handler);
 PG_FUNCTION_INFO_V1(lsm3_btree_wrapper);
 PG_FUNCTION_INFO_V1(lsm3_get_merge_count);
+PG_FUNCTION_INFO_V1(lsm3_start_merge);
+PG_FUNCTION_INFO_V1(lsm3_wait_merge_completion);
 
 extern void	_PG_init(void);
 extern void	_PG_fini(void);
@@ -174,9 +176,9 @@ lsm3_launch_bgworker(Lsm3DictEntry* entry)
 		elog(ERROR, "Lsm3: startup of background worker is failed");
 	}
 	entry->merger = BackendPidGetProc(bgw_pid);
-	for (int n_attempts = 0; entry->merger == NULL || n_attempts < 10; n_attempts++)
+	for (int n_attempts = 0; entry->merger == NULL || n_attempts < 100; n_attempts++)
 	{
-		pg_usleep(1000); /* wait background worker to be registered in procarray */
+		pg_usleep(10000); /* wait background worker to be registered in procarray */
 		entry->merger = BackendPidGetProc(bgw_pid);
 	}
 	if (entry->merger == NULL)
@@ -962,3 +964,46 @@ lsm3_get_merge_count(PG_FUNCTION_ARGS)
 		PG_RETURN_INT64(entry->n_merges);
 }
 
+
+Datum
+lsm3_start_merge(PG_FUNCTION_ARGS)
+{
+	Oid	relid = PG_GETARG_OID(0);
+	Relation index = index_open(relid, AccessShareLock);
+	Lsm3DictEntry* entry = lsm3_get_entry(index);
+	index_close(index, AccessShareLock);
+
+	SpinLockAcquire(&entry->spinlock);
+	if (!entry->merge_in_progress)
+	{
+		entry->merge_in_progress = true;
+		entry->active_index ^= 1;
+		entry->n_merges += 1;
+		if (entry->access_count[1-entry->active_index] == 0)
+		{
+			entry->start_merge = true;
+			if (entry->merger == NULL) /* lazy start of bgworker */
+			{
+				lsm3_launch_bgworker(entry);
+			}
+			SetLatch(&entry->merger->procLatch);
+		}
+	}
+	SpinLockRelease(&entry->spinlock);
+	PG_RETURN_NULL();
+}
+
+Datum
+lsm3_wait_merge_completion(PG_FUNCTION_ARGS)
+{
+	Oid	relid = PG_GETARG_OID(0);
+	Relation index = index_open(relid, AccessShareLock);
+	Lsm3DictEntry* entry = lsm3_get_entry(index);
+	index_close(index, AccessShareLock);
+
+	while (entry->merge_in_progress)
+	{
+		pg_usleep(1000000); /* one second */
+	}
+	PG_RETURN_NULL();
+}

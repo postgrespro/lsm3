@@ -789,3 +789,11 @@ CREATE OPERATOR CLASS uuid_ops DEFAULT
 -- Number of index merges since server start
 CREATE FUNCTION lsm3_get_merge_count(index regclass) returns bigint
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT PARALLEL RESTRICTED;
+
+-- Force merge of top index. 
+CREATE FUNCTION lsm3_start_merge(index regclass) returns void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT PARALLEL RESTRICTED;
+
+-- Wait merge completion
+CREATE FUNCTION lsm3_wait_merge_completion(index regclass) returns void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT PARALLEL RESTRICTED;
