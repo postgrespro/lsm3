@@ -39,6 +39,7 @@ PG_FUNCTION_INFO_V1(lsm3_btree_wrapper);
 PG_FUNCTION_INFO_V1(lsm3_get_merge_count);
 PG_FUNCTION_INFO_V1(lsm3_start_merge);
 PG_FUNCTION_INFO_V1(lsm3_wait_merge_completion);
+PG_FUNCTION_INFO_V1(lsm3_top_index_size);
 
 extern void	_PG_init(void);
 extern void	_PG_fini(void);
@@ -1006,4 +1007,14 @@ lsm3_wait_merge_completion(PG_FUNCTION_ARGS)
 		pg_usleep(1000000); /* one second */
 	}
 	PG_RETURN_NULL();
+}
+
+Datum
+lsm3_top_index_size(PG_FUNCTION_ARGS)
+{
+	Oid	relid = PG_GETARG_OID(0);
+	Relation index = index_open(relid, AccessShareLock);
+	Lsm3DictEntry* entry = lsm3_get_entry(index);
+	index_close(index, AccessShareLock);
+	PG_RETURN_INT32(lsm3_get_index_size(lsm3_get_index_size(entry->top[entry->active_index])));
 }

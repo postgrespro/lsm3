@@ -797,3 +797,7 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT PARALLEL RESTRICTED;
 -- Wait merge completion
 CREATE FUNCTION lsm3_wait_merge_completion(index regclass) returns void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT PARALLEL RESTRICTED;
+
+-- Get active top index size (number of blocks)
+CREATE FUNCTION lsm3_top_index_size(index regclass) returns void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT PARALLEL RESTRICTED;
