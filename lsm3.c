@@ -1016,5 +1016,5 @@ lsm3_top_index_size(PG_FUNCTION_ARGS)
 	Relation index = index_open(relid, AccessShareLock);
 	Lsm3DictEntry* entry = lsm3_get_entry(index);
 	index_close(index, AccessShareLock);
-	PG_RETURN_INT32(lsm3_get_index_size(lsm3_get_index_size(entry->top[entry->active_index])));
+	PG_RETURN_INT64((uint64)lsm3_get_index_size(lsm3_get_index_size(entry->top[entry->active_index]))*BLCKSZ);
 }
