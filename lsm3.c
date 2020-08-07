@@ -4,14 +4,17 @@
 #include "access/reloptions.h"
 #include "access/nbtree.h"
 #include "access/table.h"
+#include "access/relation.h"
 #include "access/relscan.h"
 #include "access/xact.h"
 #include "commands/defrem.h"
 #include "funcapi.h"
 #include "utils/rel.h"
 #include "nodes/makefuncs.h"
+#include "catalog/dependency.h"
 #include "catalog/pg_operator.h"
 #include "catalog/index.h"
+#include "catalog/namespace.h"
 #include "catalog/storage.h"
 #include "utils/lsyscache.h"
 #include "utils/typcache.h"
@@ -651,7 +654,6 @@ lsm3_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	return ntids;
 }
 
-
 Datum
 lsm3_handler(PG_FUNCTION_ARGS)
 {
@@ -819,7 +821,43 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 	)
 {
     Node *parseTree = plannedStmt->utilityStmt;
+	DropStmt* drop  = NULL;
+	ObjectAddresses *drop_objects = NULL;
+	List* drop_oids = NULL;
+	ListCell* cell;
+
 	Lsm3Entry = NULL; /* Reset entry to check it after utility statement execution */
+	if (IsA(parseTree, DropStmt))
+	{
+		drop = (DropStmt*)parseTree;
+		if (drop->removeType == OBJECT_INDEX)
+		{
+			foreach (cell, drop->objects)
+			{
+				RangeVar* rv = makeRangeVarFromNameList((List *) lfirst(cell));
+				Relation index = relation_openrv(rv, ExclusiveLock);
+				if (index->rd_indam->ambuild  == lsm3_build)
+				{
+					Lsm3DictEntry* entry = lsm3_get_entry(index);
+					if (drop_objects == NULL)
+					{
+						drop_objects = new_object_addresses();
+					}
+					for (int i = 0; i < 2; i++)
+					{
+						ObjectAddress obj;
+						obj.classId = RelationRelationId;
+						obj.objectId = entry->top[i];
+						obj.objectSubId = 0;
+						add_exact_object_address(&obj, drop_objects);
+					}
+					drop_oids = lappend_oid(drop_oids, RelationGetRelid(index));
+				}
+				relation_close(index, ExclusiveLock);
+			}
+		}
+	}
+
 	(PreviousProcessUtilityHook ? PreviousProcessUtilityHook : standard_ProcessUtility)
 		(plannedStmt,
 		 queryString,
@@ -863,6 +901,16 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 		stmt->accessMethod = originAccessMethod;
 		stmt->idxname = originIndexName;
 		LWLockRelease(Lsm3DictLock); /* Release lock set by lsm3_build */
+	}
+	else if (drop_objects)
+	{
+		performMultipleDeletions(drop_objects, drop->behavior, 0);
+		LWLockAcquire(Lsm3DictLock, LW_EXCLUSIVE);
+		foreach (cell, drop_oids)
+		{
+			hash_search(Lsm3Dict, &lfirst_oid(cell), HASH_REMOVE, NULL);
+		}
+		LWLockRelease(Lsm3DictLock);
 	}
 }
 
