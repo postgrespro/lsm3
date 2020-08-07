@@ -43,7 +43,7 @@ typedef struct
 /* Lsm3 index options */
 typedef struct
 {
-	int32		vl_len_;		/* Varlena header (do not touch directly!) */
+	BTOptions   nbt_opts;       /* Standard B-Tree options */
 	int         top_index_size; /* Size of top index (overrode lsm3.top_index_size GUC */
 	bool        unique;			/* Index may not contain duplicates. We prohibit unique constraint for Lsm3 index
                                  * because it can not be enforced. But presence of this index option allows to optimize

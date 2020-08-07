@@ -271,6 +271,11 @@ static bytea *
 lsm3_options(Datum reloptions, bool validate)
 {
 	static const relopt_parse_elt tab[] = {
+		{"fillfactor", RELOPT_TYPE_INT, offsetof(BTOptions, fillfactor)},
+		{"vacuum_cleanup_index_scale_factor", RELOPT_TYPE_REAL,
+		offsetof(BTOptions, vacuum_cleanup_index_scale_factor)},
+		{"deduplicate_items", RELOPT_TYPE_BOOL,
+		 offsetof(BTOptions, deduplicate_items)},
 		{"top_index_size", RELOPT_TYPE_INT, offsetof(Lsm3Options, top_index_size)},
 		{"unique", RELOPT_TYPE_BOOL, offsetof(Lsm3Options, unique)}
 	};
@@ -974,12 +979,22 @@ _PG_init(void)
 							NULL);
 
 	Lsm3ReloptKind = add_reloption_kind();
+
 	add_bool_reloption(Lsm3ReloptKind, "unique",
 					   "Index contains no duplicates",
 					   false, AccessExclusiveLock);
 	add_int_reloption(Lsm3ReloptKind, "top_index_size",
 					  "Size of top index (kb)",
 					  0, 0, INT_MAX, AccessExclusiveLock);
+	add_int_reloption(Lsm3ReloptKind, "fillfactor",
+					  "Packs btree index pages only to this percentage",
+					  BTREE_DEFAULT_FILLFACTOR, BTREE_MIN_FILLFACTOR, 100, ShareUpdateExclusiveLock);
+	add_real_reloption(Lsm3ReloptKind, "vacuum_cleanup_index_scale_factor",
+					  "Packs btree index pages only to this percentage",
+					  -1, 0.0, 1e10, ShareUpdateExclusiveLock);
+	add_bool_reloption(Lsm3ReloptKind, "deduplicate_items",
+					   "Enables \"deduplicate items\" feature for this btree index",
+					   true, AccessExclusiveLock);
 
 	RequestAddinShmemSpace(hash_estimate_size(Lsm3MaxIndexes, sizeof(Lsm3DictEntry)));
 	RequestNamedLWLockTranche("lsm3", 1);
