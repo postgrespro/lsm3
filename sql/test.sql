@@ -47,3 +47,11 @@ reindex table t;
 select * from t where k = 1;
 
 drop table t;
+
+create table lsm(k bigint);
+insert into lsm values (generate_series(1, 1000000));
+create index concurrently on lsm using lsm3(k);
+select * from lsm where k = 1;
+
+drop table lsm;
+

@@ -884,7 +884,11 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 
 			for (int i = 0; i < 2; i++)
 			{
-				stmt->accessMethod = "lsm3_btree_wrapper";
+				if (stmt->concurrent)
+				{
+					PushActiveSnapshot(GetTransactionSnapshot());
+				}
+			    stmt->accessMethod = "lsm3_btree_wrapper";
 				stmt->idxname = psprintf("%s_top%d", get_rel_name(Lsm3Entry->base), i);
 				Lsm3Entry->top[i] = DefineIndex(Lsm3Entry->heap,
 												stmt,
