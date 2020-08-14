@@ -902,7 +902,6 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 		}
 		else
 		{
-			Assert (IsA(parseTree, TruncateStmt));
 			for (int i = 0; i < 2; i++)
 			{
 				if (Lsm3Entry->top[i] == InvalidOid)

@@ -43,4 +43,7 @@ truncate table t;
 insert into t values (generate_series(1,1000000), 1);
 select * from t where k = 1;
 
+reindex table t;
+select * from t where k = 1;
+
 drop table t;

@@ -155,4 +155,11 @@ select * from t where k = 1;
  1 |   1
 (1 row)
 
+reindex table t;
+select * from t where k = 1;
+ k | val 
+---+-----
+ 1 |   1
+(1 row)
+
 drop table t;
