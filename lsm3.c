@@ -416,11 +416,13 @@ lsm3_build(Relation heap, Relation index, IndexInfo *indexInfo)
 {
 	Oid save_am = index->rd_rel->relam;
 	IndexBuildResult * result;
-
+	bool found;
 	LWLockAcquire(Lsm3DictLock, LW_EXCLUSIVE); /* Obtain exclusive lock on dictionary: it will be released in utility hook */
-	Lsm3Entry = hash_search(Lsm3Dict, &RelationGetRelid(index), HASH_ENTER, NULL); /* Setting Lsm3Entry indicates to utility hook that Lsm3 index was created */
-	lsm3_init_entry(Lsm3Entry, index);
-
+	Lsm3Entry = hash_search(Lsm3Dict, &RelationGetRelid(index), HASH_ENTER, &found); /* Setting Lsm3Entry indicates to utility hook that Lsm3 index was created */
+	if (!found)
+	{
+		lsm3_init_entry(Lsm3Entry, index);
+	}
 	index->rd_rel->relam = BTREE_AM_OID;
 	result = btbuild(heap, index, indexInfo);
 	index->rd_rel->relam = save_am;
@@ -872,39 +874,59 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 		 destReceiver,
 		 completionTag);
 
-	if (Lsm3Entry) /* This is Lsm3 creation statement */
+	if (Lsm3Entry)
 	{
-		int i;
-		IndexStmt* stmt = (IndexStmt*)parseTree;
-		char* originIndexName = stmt->idxname;
-		char* originAccessMethod = stmt->accessMethod;
-
-		for (i = 0; i < 2; i++)
+		if (IsA(parseTree, IndexStmt)) /* This is Lsm3 creation statement */
 		{
-			stmt->accessMethod = "lsm3_btree_wrapper";
-			stmt->idxname = psprintf("%s_top%d", get_rel_name(Lsm3Entry->base), i);
-			Lsm3Entry->top[i] = DefineIndex(Lsm3Entry->heap,
-											stmt,
-											InvalidOid,
-											InvalidOid,
-											InvalidOid,
-											false,
-											false,
-											false,
-											false,
-											true).objectId;
+			IndexStmt* stmt = (IndexStmt*)parseTree;
+			char* originIndexName = stmt->idxname;
+			char* originAccessMethod = stmt->accessMethod;
+
+			for (int i = 0; i < 2; i++)
+			{
+				stmt->accessMethod = "lsm3_btree_wrapper";
+				stmt->idxname = psprintf("%s_top%d", get_rel_name(Lsm3Entry->base), i);
+				Lsm3Entry->top[i] = DefineIndex(Lsm3Entry->heap,
+												stmt,
+												InvalidOid,
+												InvalidOid,
+												InvalidOid,
+												false,
+												false,
+												false,
+												false,
+												true).objectId;
+			}
+			stmt->accessMethod = originAccessMethod;
+			stmt->idxname = originIndexName;
+		}
+		else
+		{
+			Assert (IsA(parseTree, TruncateStmt));
+			for (int i = 0; i < 2; i++)
+			{
+				if (Lsm3Entry->top[i] == InvalidOid)
+				{
+					char* topidxname = psprintf("%s_top%d", get_rel_name(Lsm3Entry->base), i);
+					Lsm3Entry->top[i] = get_relname_relid(topidxname, get_rel_namespace(Lsm3Entry->base));
+					if (Lsm3Entry->top[i] == InvalidOid)
+					{
+						elog(ERROR, "Lsm3: failed to lookup %s index", topidxname);
+					}
+				}
+			}
 		}
 		if (ActiveSnapshotSet())
+		{
 			PopActiveSnapshot();
+		}
 		CommitTransactionCommand();
 		StartTransactionCommand();
 		/*  Mark top index as invalid to prevent planner from using it in queries */
-		for (i = 0; i < 2; i++)
+		for (int i = 0; i < 2; i++)
 		{
 			index_set_state_flags(Lsm3Entry->top[i], INDEX_DROP_CLEAR_VALID);
 		}
-		stmt->accessMethod = originAccessMethod;
-		stmt->idxname = originIndexName;
 		LWLockRelease(Lsm3DictLock); /* Release lock set by lsm3_build */
 	}
 	else if (drop_objects)
