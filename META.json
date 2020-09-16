@@ -7,18 +7,6 @@
 	"license": {
 		"PostgreSQL": "http://www.postgresql.org/about/licence"
 	},
-	"release_status": "stable",
-	"prereqs": {
-		"runtime": {
-			"requires": {
-				"plpgsql": 0,
-				"PostgreSQL": "11.0"
-			},
-			"recommends": {
-				"PostgreSQL": "12.0"
-			}
-		}
-	},
 	"provides": {
 		"lsm3": {
 			"file": "lsm3--1.0.sql",
@@ -27,7 +15,7 @@
 			"abstract": "LSM tree implemented using standard Postgres B-Tree indexes"
 		}
 	},
-	"tags": ["LSM"],
+	"tags": ["LSM", "Log-structured merge-tree"],
 	"resources":  {
         "repository": {
             "url": "git@github.com:postgrespro/lsm3.git",
