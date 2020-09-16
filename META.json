@@ -1,6 +1,6 @@
 {
    "name": "lsm3",
-   "abstract": "LSM tree implemented using standard Postgres B-Tree indexes,
+   "abstract": "LSM tree implemented using standard Postgres B-Tree indexes",
    "description": "LSM3 provides fast inserts because of background index updates and improving index access locality.
 Top index is used to perform fast inserts and on overflow it is merged
 with base index. To perform merge operation concurrently
