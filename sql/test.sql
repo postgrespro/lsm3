@@ -24,6 +24,7 @@ select lsm3_get_merge_count('lsm3_index');
 select * from t where k = 1;
 select * from t order by k;
 select * from t order by k desc;
+analyze t;
 explain (COSTS OFF, TIMING OFF, SUMMARY OFF) select * from t order by k;
 
 insert into t values (generate_series(1,100000), 1);
@@ -36,6 +37,7 @@ select * from t where k = 1;
 select * from t where k = 1000000;
 select * from t where k = 2000000;
 select * from t where k = 3000000;
+analyze t;
 explain (COSTS OFF, TIMING OFF, SUMMARY OFF) select * from t where k = 1;
 select lsm3_get_merge_count('lsm3_index') > 5;
 

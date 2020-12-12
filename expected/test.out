@@ -99,6 +99,7 @@ select * from t order by k desc;
  1 |  10
 (5 rows)
 
+analyze t;
 explain (COSTS OFF, TIMING OFF, SUMMARY OFF) select * from t order by k;
             QUERY PLAN            
 ----------------------------------
@@ -134,6 +135,7 @@ select * from t where k = 3000000;
 ---+-----
 (0 rows)
 
+analyze t;
 explain (COSTS OFF, TIMING OFF, SUMMARY OFF) select * from t where k = 1;
             QUERY PLAN            
 ----------------------------------
