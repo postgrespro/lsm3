@@ -213,6 +213,12 @@ lsm3_truncate_index(Oid index_oid, Oid heap_oid)
 	table_close(heap, AccessShareLock);
 }
 
+#if PG_VERSION_NUM>=140000
+#define INSERT_FLAGS UNIQUE_CHECK_NO, false
+#else
+#define INSERT_FLAGS false
+#endif
+
 /* Merge top index into base index */
 static void
 lsm3_merge_indexes(Oid dst_oid, Oid src_oid, Oid heap_oid)
@@ -247,14 +253,14 @@ lsm3_merge_indexes(Oid dst_oid, Oid src_oid, Oid heap_oid)
 			unsigned short save_info = itup->t_info;
 			itup->t_info = (save_info & ~(INDEX_SIZE_MASK | INDEX_ALT_TID_MASK)) + BTreeTupleGetPostingOffset(itup);
 			itup->t_tid = scan->xs_heaptid;
-			_bt_doinsert(base_index, itup, false, heap); /* lsm3 index is not unique so need not to heck for duplica
+			_bt_doinsert(base_index, itup, INSERT_FLAGS, heap); /* lsm3 index is not unique so need not to heck for duplica
 tes */
 			itup->t_tid = save_tid;
 			itup->t_info = save_info;
 		}
 		else
 		{
-			_bt_doinsert(base_index, itup, false, heap); /* lsm3 index is not unique so need not to heck for duplica
+			_bt_doinsert(base_index, itup, INSERT_FLAGS, heap); /* lsm3 index is not unique so need not to heck for duplica
 tes */
 		}
 	}
@@ -435,6 +441,9 @@ static bool
 lsm3_insert(Relation rel, Datum *values, bool *isnull,
 			ItemPointer ht_ctid, Relation heapRel,
 			IndexUniqueCheck checkUnique,
+#if PG_VERSION_NUM>=140000
+			bool indexUnchanged,
+#endif
 			IndexInfo *indexInfo)
 {
 	Lsm3DictEntry* entry = lsm3_get_entry(rel);
@@ -457,7 +466,11 @@ lsm3_insert(Relation rel, Datum *values, bool *isnull,
 	index = index_open(entry->top[active_index], RowExclusiveLock);
 	index->rd_rel->relam = BTREE_AM_OID;
 	save_am = index->rd_rel->relam;
-	btinsert(index, values, isnull, ht_ctid, heapRel, checkUnique, indexInfo);
+	btinsert(index, values, isnull, ht_ctid, heapRel, checkUnique,
+#if PG_VERSION_NUM>=140000
+			 indexUnchanged,
+#endif
+			 indexInfo);
 	index_close(index, RowExclusiveLock);
 	index->rd_rel->relam = save_am;
 
@@ -755,6 +768,9 @@ static bool
 lsm3_dummy_insert(Relation rel, Datum *values, bool *isnull,
 				  ItemPointer ht_ctid, Relation heapRel,
 				  IndexUniqueCheck checkUnique,
+#if PG_VERSION_NUM>=140000
+				  bool indexUnchanged,
+#endif
 				  IndexInfo *indexInfo)
 {
 	return false;
