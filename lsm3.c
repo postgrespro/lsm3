@@ -50,10 +50,11 @@ extern void	_PG_fini(void);
 extern void lsm3_merger_main(Datum arg);
 
 /* Lsm3 dictionary (hashtable with control data for all indexes) */
-static Lsm3DictEntry* Lsm3Entry;
 static HTAB*          Lsm3Dict;
 static LWLock*        Lsm3DictLock;
 static List*          Lsm3ReleasedLocks;
+static List*          Lsm3Entries;
+static bool           Lsm3InsideCopy;
 
 /* Kind of relation optioms for Lsm3 index */
 static relopt_kind    Lsm3ReloptKind;
@@ -423,17 +424,45 @@ lsm3_build(Relation heap, Relation index, IndexInfo *indexInfo)
 	Oid save_am = index->rd_rel->relam;
 	IndexBuildResult * result;
 	bool found;
-	LWLockAcquire(Lsm3DictLock, LW_EXCLUSIVE); /* Obtain exclusive lock on dictionary: it will be released in utility hook */
-	Lsm3Entry = hash_search(Lsm3Dict, &RelationGetRelid(index), HASH_ENTER, &found); /* Setting Lsm3Entry indicates to utility hook that Lsm3 index was created */
+	Lsm3DictEntry* entry;
+	if (Lsm3Entries == NULL) { // multiple indexes can be rebuilt by truncate
+		LWLockAcquire(Lsm3DictLock, LW_EXCLUSIVE); /* Obtain exclusive lock on dictionary: it will be released in utility hook */
+	}
+	elog(LOG, "lsm3_build %s", index->rd_rel->relname.data);
+	entry = hash_search(Lsm3Dict, &RelationGetRelid(index), HASH_ENTER, &found); /* Setting Lsm3Entry indicates to utility hook that Lsm3 index was created */
 	if (!found)
 	{
-		lsm3_init_entry(Lsm3Entry, index);
+		lsm3_init_entry(entry, index);
+	}
+	{
+		MemoryContext old_context = MemoryContextSwitchTo(TopMemoryContext);
+		Lsm3Entries = lappend(Lsm3Entries, entry);
+		MemoryContextSwitchTo(old_context);
 	}
 	index->rd_rel->relam = BTREE_AM_OID;
 	result = btbuild(heap, index, indexInfo);
 	index->rd_rel->relam = save_am;
 
 	return result;
+}
+
+/*
+ * Grab previously release self locks (to let merger to proceed).
+ */
+static void
+lsm3_reacquire_locks(void)
+{
+	if (Lsm3ReleasedLocks)
+	{
+		ListCell* cell;
+		foreach (cell, Lsm3ReleasedLocks)
+		{
+			Oid indexOid = lfirst_oid(cell);
+			LockRelationOid(indexOid, RowExclusiveLock);
+		}
+		list_free(Lsm3ReleasedLocks);
+		Lsm3ReleasedLocks = NULL;
+	}
 }
 
 /* Insert in active top index, on overflow swap active indexes and initiate merge to base index */
@@ -475,7 +504,7 @@ lsm3_insert(Relation rel, Datum *values, bool *isnull,
 	index->rd_rel->relam = save_am;
 
 	overflow = !entry->merge_in_progress /* do not check for overflow if merge was already initiated */
-		&& (entry->n_inserts % LSM3_CHECK_TOP_INDEX_SIZE_PERIOD) == 0 /* perform check only each N-th insert  */
+ 		&& (entry->n_inserts % LSM3_CHECK_TOP_INDEX_SIZE_PERIOD) == 0 /* perform check only each N-th insert  */
 		&& RelationGetNumberOfBlocks(index)*(BLCKSZ/1024) > top_index_size;
 
 	SpinLockAcquire(&entry->spinlock);
@@ -499,8 +528,18 @@ lsm3_insert(Relation rel, Datum *values, bool *isnull,
 		/* Holding lock on non-ative index prevent merger bgworker from truncation this index */
 		if (LockHeldByMe(&tag, RowExclusiveLock))
 		{
-			LockRelease(&tag, RowExclusiveLock, false);
-			Lsm3ReleasedLocks = lappend_oid(Lsm3ReleasedLocks, entry->top[1-active_index]);
+			/* Copy locks all indexes and hold this locks until end of copy.
+			 * We can not just release lock, because otherwise CopyFrom produces
+			 * "you don't own a lock of type" warning.
+			 * So just try to periodically release this lock and let merger grab it.
+			 */
+			if (!Lsm3InsideCopy ||
+				(entry->n_inserts % LSM3_CHECK_TOP_INDEX_SIZE_PERIOD) == 0) /* release lock only each N-th insert  */
+
+			{
+				LockRelease(&tag, RowExclusiveLock, false);
+				Lsm3ReleasedLocks = lappend_oid(Lsm3ReleasedLocks, entry->top[1-active_index]);
+			}
 		}
 
 		/* If all inserts in previous active index are completed then we can start merge */
@@ -516,6 +555,12 @@ lsm3_insert(Relation rel, Datum *values, bool *isnull,
 	}
 	SpinLockRelease(&entry->spinlock);
 
+	/* We have to require released locks because othervise CopyFrom will produce warning */
+	if (Lsm3InsideCopy && Lsm3ReleasedLocks)
+	{
+		pg_usleep(1); /* give merge thread a chance to grab the lock before we require it */
+		lsm3_reacquire_locks();
+	}
 	return false;
 }
 
@@ -849,7 +894,8 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 	List* drop_oids = NULL;
 	ListCell* cell;
 
-	Lsm3Entry = NULL; /* Reset entry to check it after utility statement execution */
+	Lsm3Entries = NULL; /* Reset entry to check it after utility statement execution */
+	Lsm3InsideCopy = false;
 	if (IsA(parseTree, DropStmt))
 	{
 		drop = (DropStmt*)parseTree;
@@ -880,6 +926,10 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 			}
 		}
 	}
+	else if (IsA(parseTree, CopyStmt))
+	{
+		Lsm3InsideCopy = true;
+	}
 
 	(PreviousProcessUtilityHook ? PreviousProcessUtilityHook : standard_ProcessUtility)
 		(plannedStmt,
@@ -890,23 +940,26 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 		 destReceiver,
 		 completionTag);
 
-	if (Lsm3Entry)
+	if (Lsm3Entries)
 	{
-		if (IsA(parseTree, IndexStmt)) /* This is Lsm3 creation statement */
+		foreach (cell, Lsm3Entries)
 		{
-			IndexStmt* stmt = (IndexStmt*)parseTree;
-			char* originIndexName = stmt->idxname;
-			char* originAccessMethod = stmt->accessMethod;
-
-			for (int i = 0; i < 2; i++)
+			Lsm3DictEntry* entry = (Lsm3DictEntry*)lfirst(cell);
+			if (IsA(parseTree, IndexStmt)) /* This is Lsm3 creation statement */
 			{
-				if (stmt->concurrent)
+				IndexStmt* stmt = (IndexStmt*)parseTree;
+				char* originIndexName = stmt->idxname;
+				char* originAccessMethod = stmt->accessMethod;
+
+				for (int i = 0; i < 2; i++)
 				{
-					PushActiveSnapshot(GetTransactionSnapshot());
-				}
-			    stmt->accessMethod = "lsm3_btree_wrapper";
-				stmt->idxname = psprintf("%s_top%d", get_rel_name(Lsm3Entry->base), i);
-				Lsm3Entry->top[i] = DefineIndex(Lsm3Entry->heap,
+					if (stmt->concurrent)
+					{
+						PushActiveSnapshot(GetTransactionSnapshot());
+					}
+					stmt->accessMethod = "lsm3_btree_wrapper";
+					stmt->idxname = psprintf("%s_top%d", get_rel_name(entry->base), i);
+					entry->top[i] = DefineIndex(entry->heap,
 												stmt,
 												InvalidOid,
 												InvalidOid,
@@ -916,36 +969,39 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 												false,
 												false,
 												true).objectId;
+				}
+				stmt->accessMethod = originAccessMethod;
+				stmt->idxname = originIndexName;
 			}
-			stmt->accessMethod = originAccessMethod;
-			stmt->idxname = originIndexName;
-		}
-		else
-		{
-			for (int i = 0; i < 2; i++)
+			else
 			{
-				if (Lsm3Entry->top[i] == InvalidOid)
+				for (int i = 0; i < 2; i++)
 				{
-					char* topidxname = psprintf("%s_top%d", get_rel_name(Lsm3Entry->base), i);
-					Lsm3Entry->top[i] = get_relname_relid(topidxname, get_rel_namespace(Lsm3Entry->base));
-					if (Lsm3Entry->top[i] == InvalidOid)
+					if (entry->top[i] == InvalidOid)
 					{
-						elog(ERROR, "Lsm3: failed to lookup %s index", topidxname);
+						char* topidxname = psprintf("%s_top%d", get_rel_name(entry->base), i);
+						entry->top[i] = get_relname_relid(topidxname, get_rel_namespace(entry->base));
+						if (entry->top[i] == InvalidOid)
+						{
+							elog(ERROR, "Lsm3: failed to lookup %s index", topidxname);
+						}
 					}
 				}
 			}
+			if (ActiveSnapshotSet())
+			{
+				PopActiveSnapshot();
+			}
+			CommitTransactionCommand();
+			StartTransactionCommand();
+			/*  Mark top index as invalid to prevent planner from using it in queries */
+			for (int i = 0; i < 2; i++)
+			{
+				index_set_state_flags(entry->top[i], INDEX_DROP_CLEAR_VALID);
+			}
 		}
-		if (ActiveSnapshotSet())
-		{
-			PopActiveSnapshot();
-		}
-		CommitTransactionCommand();
-		StartTransactionCommand();
-		/*  Mark top index as invalid to prevent planner from using it in queries */
-		for (int i = 0; i < 2; i++)
-		{
-			index_set_state_flags(Lsm3Entry->top[i], INDEX_DROP_CLEAR_VALID);
-		}
+		list_free(Lsm3Entries);
+		Lsm3Entries = NULL;
 		LWLockRelease(Lsm3DictLock); /* Release lock set by lsm3_build */
 	}
 	else if (drop_objects)
@@ -961,23 +1017,14 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 }
 
 /*
- * Executor sinish hookto reclaim released locks on non-active top indexes
+ * Executor finish hook to reclaim released locks on non-active top indexes
  * to avoid "you don't own a lock of type RowExclusiveLock" warning
  */
 static void
 lsm3_executor_finish(QueryDesc *queryDesc)
 {
-	if (Lsm3ReleasedLocks)
-	{
-		ListCell* cell;
-		foreach (cell, Lsm3ReleasedLocks)
-		{
-			Oid indexOid = lfirst_oid(cell);
-			LockRelationOid(indexOid, RowExclusiveLock);
-		}
-		list_free(Lsm3ReleasedLocks);
-		Lsm3ReleasedLocks = NULL;
-	}
+	lsm3_reacquire_locks();
+	Lsm3InsideCopy = false;
 	if (PreviousExecutorFinish)
 		PreviousExecutorFinish(queryDesc);
 	else
