@@ -7,6 +7,7 @@
 #include "access/relation.h"
 #include "access/relscan.h"
 #include "access/xact.h"
+#include "access/xloginsert.h"
 #include "commands/defrem.h"
 #include "funcapi.h"
 #include "utils/rel.h"
@@ -20,6 +21,7 @@
 #include "utils/typcache.h"
 #include "utils/builtins.h"
 #include "utils/index_selfuncs.h"
+#include "utils/rel.h"
 #include "miscadmin.h"
 #include "tcop/utility.h"
 #include "postmaster/bgworker.h"
@@ -29,6 +31,7 @@
 #include "storage/latch.h"
 #include "storage/lock.h"
 #include "storage/lmgr.h"
+#include "storage/proc.h"
 #include "storage/procarray.h"
 
 #include "lsm3.h"
@@ -783,7 +786,11 @@ lsm3_build_empty(Relation heap, Relation index, IndexInfo *indexInfo)
 	metapage = (Page) palloc(BLCKSZ);
 	_bt_initmetapage(metapage, BTREE_METAPAGE, 0, _bt_allequalimage(index, false));
 
+#if PG_VERSION_NUM>=150000
+	RelationGetSmgr(index);
+#else
 	RelationOpenSmgr(index);
+#endif
 
 	/*
 	 * Write the page and log it.  It might seem that an immediate sync would
@@ -877,6 +884,9 @@ lsm3_btree_wrapper(PG_FUNCTION_ARGS)
 static void
 lsm3_process_utility(PlannedStmt *plannedStmt,
 					 const char *queryString,
+#if PG_VERSION_NUM>=150000
+					 bool readOnlyTree,
+#endif
 					 ProcessUtilityContext context,
 					 ParamListInfo paramListInfo,
 					 QueryEnvironment *queryEnvironment,
@@ -934,6 +944,9 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 	(PreviousProcessUtilityHook ? PreviousProcessUtilityHook : standard_ProcessUtility)
 		(plannedStmt,
 		 queryString,
+#if PG_VERSION_NUM>=150000
+		 readOnlyTree,
+#endif
 		 context,
 		 paramListInfo,
 		 queryEnvironment,
