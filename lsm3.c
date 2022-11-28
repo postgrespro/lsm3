@@ -65,6 +65,7 @@ static relopt_kind    Lsm3ReloptKind;
 /* Lsm3 kooks */
 static ProcessUtility_hook_type PreviousProcessUtilityHook = NULL;
 static shmem_startup_hook_type  PreviousShmemStartupHook = NULL;
+static shmem_request_hook_type  PreviousShmemRequestHook = NULL;
 static ExecutorFinish_hook_type PreviousExecutorFinish = NULL;
 
 /* Lsm3 GUCs */
@@ -73,6 +74,16 @@ static int Lsm3TopIndexSize;
 
 /* Background worker termination flag */
 static volatile bool Lsm3Cancel;
+
+static void
+lsm3_shmem_request(void)
+{
+	if (PreviousShmemRequestHook)
+		PreviousShmemRequestHook();
+
+	RequestAddinShmemSpace(hash_estimate_size(Lsm3MaxIndexes, sizeof(Lsm3DictEntry)));
+	RequestNamedLWLockTranche("lsm3", 1);
+}
 
 static void
 lsm3_shmem_startup(void)
@@ -381,7 +392,7 @@ lsm3_build_sortkeys(Relation index)
 		/* Abbreviation is not supported here */
 		sortKey->abbreviate = false;
 
-		AssertState(sortKey->ssup_attno != 0);
+		Assert(sortKey->ssup_attno != 0);
 
 		strategy = (scanKey->sk_flags & SK_BT_DESC) != 0 ?
 			BTGreaterStrategyNumber : BTLessStrategyNumber;
@@ -802,9 +813,13 @@ lsm3_build_empty(Relation heap, Relation index, IndexInfo *indexInfo)
 	PageSetChecksumInplace(metapage, BTREE_METAPAGE);
 	smgrextend(index->rd_smgr, MAIN_FORKNUM, BTREE_METAPAGE,
 			   (char *) metapage, true);
+#if PG_VERSION_NUM>=150000
+	log_newpage(&index->rd_smgr->smgr_rlocator.locator, MAIN_FORKNUM,
+				BTREE_METAPAGE, metapage, true);
+#else
 	log_newpage(&index->rd_smgr->smgr_rnode.node, MAIN_FORKNUM,
 				BTREE_METAPAGE, metapage, true);
-
+#endif
 	/*
 	 * An immediate sync is required even if we xlog'd the page, because the
 	 * write did not go through shared_buffers and therefore a concurrent
@@ -1097,23 +1112,21 @@ _PG_init(void)
 					   "Enables \"deduplicate items\" feature for this btree index",
 					   true, AccessExclusiveLock);
 
-	RequestAddinShmemSpace(hash_estimate_size(Lsm3MaxIndexes, sizeof(Lsm3DictEntry)));
-	RequestNamedLWLockTranche("lsm3", 1);
-
 	PreviousShmemStartupHook = shmem_startup_hook;
 	shmem_startup_hook = lsm3_shmem_startup;
+
+#if PG_VERSION_NUM>=150000
+	PreviousShmemRequestHook = shmem_request_hook;
+	shmem_request_hook = lsm3_shmem_request;
+#else
+	lsm3_shmem_request();
+#endif
 
 	PreviousProcessUtilityHook = ProcessUtility_hook;
     ProcessUtility_hook = lsm3_process_utility;
 
 	PreviousExecutorFinish = ExecutorFinish_hook;
 	ExecutorFinish_hook = lsm3_executor_finish;
-}
-
-void _PG_fini(void)
-{
-    ProcessUtility_hook = PreviousProcessUtilityHook;
-	shmem_startup_hook = PreviousShmemStartupHook;
 }
 
 Datum
