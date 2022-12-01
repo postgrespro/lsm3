@@ -813,7 +813,7 @@ lsm3_build_empty(Relation heap, Relation index, IndexInfo *indexInfo)
 	PageSetChecksumInplace(metapage, BTREE_METAPAGE);
 	smgrextend(index->rd_smgr, MAIN_FORKNUM, BTREE_METAPAGE,
 			   (char *) metapage, true);
-#if PG_VERSION_NUM>=150000
+#if PG_VERSION_NUM>=160000
 	log_newpage(&index->rd_smgr->smgr_rlocator.locator, MAIN_FORKNUM,
 				BTREE_METAPAGE, metapage, true);
 #else
