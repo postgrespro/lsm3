@@ -971,11 +971,14 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 					}
 					for (int i = 0; i < 2; i++)
 					{
-						ObjectAddress obj;
-						obj.classId = RelationRelationId;
-						obj.objectId = entry->top[i];
-						obj.objectSubId = 0;
-						add_exact_object_address(&obj, drop_objects);
+						if (entry->top[i])
+						{
+							ObjectAddress obj;
+							obj.classId = RelationRelationId;
+							obj.objectId = entry->top[i];
+							obj.objectSubId = 0;
+							add_exact_object_address(&obj, drop_objects);
+						}
 					}
 					drop_oids = lappend_oid(drop_oids, RelationGetRelid(index));
 				}
