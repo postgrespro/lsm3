@@ -22,6 +22,7 @@ typedef struct
 	PGPROC* merger;   /* Merger background worker */
 	Oid     db_id;    /* user ID (for background worker) */
 	Oid     user_id;  /* database Id (for background worker) */
+	Oid     am_id;    /* Lsm3 AM Oid */
 	int     top_index_size; /* Size of top index */
 	slock_t spinlock; /* Spinlock to synchronize access */
 } Lsm3DictEntry;

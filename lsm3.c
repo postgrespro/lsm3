@@ -435,13 +435,9 @@ lsm3_compare_index_tuples(IndexScanDesc scan1, IndexScanDesc scan2, SortSupport 
 static IndexBuildResult *
 lsm3_build(Relation heap, Relation index, IndexInfo *indexInfo)
 {
-	Oid save_am = index->rd_rel->relam;
-	IndexBuildResult * result;
 	bool found;
 	Lsm3DictEntry* entry;
-	if (Lsm3Entries == NULL) { // multiple indexes can be rebuilt by truncate
-		LWLockAcquire(Lsm3DictLock, LW_EXCLUSIVE); /* Obtain exclusive lock on dictionary: it will be released in utility hook */
-	}
+	LWLockAcquire(Lsm3DictLock, LW_EXCLUSIVE);
 	elog(LOG, "lsm3_build %s", index->rd_rel->relname.data);
 	entry = hash_search(Lsm3Dict, &RelationGetRelid(index), HASH_ENTER, &found); /* Setting Lsm3Entry indicates to utility hook that Lsm3 index was created */
 	if (!found)
@@ -453,11 +449,10 @@ lsm3_build(Relation heap, Relation index, IndexInfo *indexInfo)
 		Lsm3Entries = lappend(Lsm3Entries, entry);
 		MemoryContextSwitchTo(old_context);
 	}
+	entry->am_id = index->rd_rel->relam;
 	index->rd_rel->relam = BTREE_AM_OID;
-	result = btbuild(heap, index, indexInfo);
-	index->rd_rel->relam = save_am;
-
-	return result;
+	LWLockRelease(Lsm3DictLock); /* Release lock set by lsm3_build */
+	return btbuild(heap, index, indexInfo);
 }
 
 /*
@@ -497,14 +492,31 @@ lsm3_insert(Relation rel, Datum *values, bool *isnull,
 	Oid  save_am;
 	bool overflow;
 	int top_index_size = entry->top_index_size ? entry->top_index_size : Lsm3TopIndexSize;
+	bool is_initialized = true;
 
 	/* Obtain current active index and increment access counter under spinlock */
 	SpinLockAcquire(&entry->spinlock);
 	active_index = entry->active_index;
-	entry->access_count[active_index] += 1;
+	if (entry->top[active_index])
+		entry->access_count[active_index] += 1;
+	else
+		is_initialized = false;
 	n_merges = entry->n_merges;
 	SpinLockRelease(&entry->spinlock);
 
+	if (!is_initialized)
+	{
+		bool res;
+		save_am = rel->rd_rel->relam;
+		rel->rd_rel->relam = BTREE_AM_OID;
+		res = btinsert(rel, values, isnull, ht_ctid, heapRel, checkUnique,
+#if PG_VERSION_NUM>=140000
+			 indexUnchanged,
+#endif
+			 indexInfo);
+		rel->rd_rel->relam = save_am;
+		return res;
+	}
 	/* Do insert in top index */
 	index = index_open(entry->top[active_index], RowExclusiveLock);
 	index->rd_rel->relam = BTREE_AM_OID;
@@ -596,15 +608,26 @@ lsm3_beginscan(Relation rel, int nkeys, int norderbys)
 	so->sortKeys = lsm3_build_sortkeys(rel);
 	for (i = 0; i < 2; i++)
 	{
-		so->top_index[i] = index_open(so->entry->top[i], AccessShareLock);
-		so->scan[i] = btbeginscan(so->top_index[i], nkeys, norderbys);
+		if (so->entry->top[i])
+		{
+			so->top_index[i] = index_open(so->entry->top[i], AccessShareLock);
+			so->scan[i] = btbeginscan(so->top_index[i], nkeys, norderbys);
+		}
+		else
+		{
+			so->top_index[i] = NULL;
+			so->scan[i] = NULL;
+		}
 	}
 	so->scan[2] = btbeginscan(rel, nkeys, norderbys);
 	for (i = 0; i < 3; i++)
 	{
-		so->eof[i] = false;
-		so->scan[i]->xs_want_itup = true;
-		so->scan[i]->parallel_scan = NULL;
+		if (so->scan[i])
+		{
+			so->eof[i] = false;
+			so->scan[i]->xs_want_itup = true;
+			so->scan[i]->parallel_scan = NULL;
+		}
 	}
 	so->unique = rel->rd_options ? ((Lsm3Options*)rel->rd_options)->unique : false;
 	so->curr_index = -1;
@@ -622,8 +645,11 @@ lsm3_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	so->curr_index = -1;
 	for (int i = 0; i < 3; i++)
 	{
-		btrescan(so->scan[i], scankey, nscankeys, orderbys, norderbys);
-		so->eof[i] = false;
+		if (so->scan[i])
+		{
+			btrescan(so->scan[i], scankey, nscankeys, orderbys, norderbys);
+			so->eof[i] = false;
+		}
 	}
 }
 
@@ -634,10 +660,13 @@ lsm3_endscan(IndexScanDesc scan)
 
 	for (int i = 0; i < 3; i++)
 	{
-		btendscan(so->scan[i]);
-		if (i < 2)
+		if (so->scan[i])
 		{
-			index_close(so->top_index[i], AccessShareLock);
+			btendscan(so->scan[i]);
+			if (i < 2)
+			{
+				index_close(so->top_index[i], AccessShareLock);
+			}
 		}
 	}
 	pfree(so);
@@ -727,8 +756,11 @@ lsm3_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	int64 ntids = 0;
 	for (int i = 0; i < 3; i++)
 	{
-		so->scan[i]->xs_snapshot = scan->xs_snapshot;
-		ntids += btgetbitmap(so->scan[i], tbm);
+		if (so->scan[i])
+		{
+			so->scan[i]->xs_snapshot = scan->xs_snapshot;
+			ntids += btgetbitmap(so->scan[i], tbm);
+		}
 	}
 	return ntids;
 }
@@ -973,6 +1005,7 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 		foreach (cell, Lsm3Entries)
 		{
 			Lsm3DictEntry* entry = (Lsm3DictEntry*)lfirst(cell);
+			Oid top_index[2];
 			if (IsA(parseTree, IndexStmt)) /* This is Lsm3 creation statement */
 			{
 				IndexStmt* stmt = (IndexStmt*)parseTree;
@@ -987,16 +1020,16 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 					}
 					stmt->accessMethod = "lsm3_btree_wrapper";
 					stmt->idxname = psprintf("%s_top%d", get_rel_name(entry->base), i);
-					entry->top[i] = DefineIndex(entry->heap,
-												stmt,
-												InvalidOid,
-												InvalidOid,
-												InvalidOid,
-												false,
-												false,
-												false,
-												false,
-												true).objectId;
+					top_index[i] = DefineIndex(entry->heap,
+											   stmt,
+											   InvalidOid,
+											   InvalidOid,
+											   InvalidOid,
+											   false,
+											   false,
+											   false,
+											   false,
+											   true).objectId;
 				}
 				stmt->accessMethod = originAccessMethod;
 				stmt->idxname = originIndexName;
@@ -1005,11 +1038,12 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 			{
 				for (int i = 0; i < 2; i++)
 				{
-					if (entry->top[i] == InvalidOid)
+					top_index[i] = entry->top[i];
+					if (top_index[i] == InvalidOid)
 					{
 						char* topidxname = psprintf("%s_top%d", get_rel_name(entry->base), i);
-						entry->top[i] = get_relname_relid(topidxname, get_rel_namespace(entry->base));
-						if (entry->top[i] == InvalidOid)
+						top_index[i] = get_relname_relid(topidxname, get_rel_namespace(entry->base));
+						if (top_index[i] == InvalidOid)
 						{
 							elog(ERROR, "Lsm3: failed to lookup %s index", topidxname);
 						}
@@ -1025,12 +1059,22 @@ lsm3_process_utility(PlannedStmt *plannedStmt,
 			/*  Mark top index as invalid to prevent planner from using it in queries */
 			for (int i = 0; i < 2; i++)
 			{
-				index_set_state_flags(entry->top[i], INDEX_DROP_CLEAR_VALID);
+				index_set_state_flags(top_index[i], INDEX_DROP_CLEAR_VALID);
+			}
+			SpinLockAcquire(&entry->spinlock);
+			for (int i = 0; i < 2; i++)
+			{
+				entry->top[i] = top_index[i];
+			}
+			SpinLockRelease(&entry->spinlock);
+			{
+				Relation index = index_open(entry->base, AccessShareLock);
+				index->rd_rel->relam = entry->am_id;
+				index_close(index, AccessShareLock);
 			}
 		}
 		list_free(Lsm3Entries);
 		Lsm3Entries = NULL;
-		LWLockRelease(Lsm3DictLock); /* Release lock set by lsm3_build */
 	}
 	else if (drop_objects)
 	{
