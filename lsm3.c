@@ -65,7 +65,9 @@ static relopt_kind    Lsm3ReloptKind;
 /* Lsm3 kooks */
 static ProcessUtility_hook_type PreviousProcessUtilityHook = NULL;
 static shmem_startup_hook_type  PreviousShmemStartupHook = NULL;
+#if PG_VERSION_NUM>=150000
 static shmem_request_hook_type  PreviousShmemRequestHook = NULL;
+#endif
 static ExecutorFinish_hook_type PreviousExecutorFinish = NULL;
 
 /* Lsm3 GUCs */
@@ -78,8 +80,10 @@ static volatile bool Lsm3Cancel;
 static void
 lsm3_shmem_request(void)
 {
+#if PG_VERSION_NUM>=150000
 	if (PreviousShmemRequestHook)
 		PreviousShmemRequestHook();
+#endif
 
 	RequestAddinShmemSpace(hash_estimate_size(Lsm3MaxIndexes, sizeof(Lsm3DictEntry)));
 	RequestNamedLWLockTranche("lsm3", 1);
